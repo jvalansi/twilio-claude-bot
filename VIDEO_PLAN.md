@@ -69,101 +69,76 @@ The current bot has inherent latency (one full round-trip per turn) but it's acc
 
 ---
 
-## Implementation Stages
+## Approaches
 
-Each stage builds on the previous and is independently testable.
-
----
-
-### Stage 1: Web Frontend + Twilio Video Room
-
-**What you build:**
-- A minimal HTML/JS page that opens the user's camera and mic via the Twilio Video JS SDK and joins a Video Room
-- A `/token` endpoint in `bot.py` that mints a Twilio Access Token (JWT) scoped to a room
-- A `/room` endpoint (or static page) that serves the frontend
-
-**Key files changed:** `bot.py` (new endpoints), `static/index.html` (new)
-
-**Outcome:** You can open a browser, click "Start", and see your own camera feed in a Twilio Video Room. No Claude yet — just a working WebRTC session. Proves the plumbing works before any AI integration.
+Three realistic paths to adding video, each with different trade-offs.
 
 ---
 
-### Stage 2: Real-time Audio → STT
+### Approach 1: Twilio Video
 
-**What you build:**
-- In the browser: capture the local audio track and stream it to the server (via WebSocket or Twilio Media Streams)
-- On the server: pipe the audio to a streaming STT service (Deepgram recommended — clean Python SDK, low latency)
-- VAD: use `webrtcvad` (Python) or Deepgram's built-in endpointing to detect end-of-utterance and emit a complete transcript
+Replace the existing TwiML voice flow with Twilio Video Rooms. Build a minimal browser frontend using the Twilio Video JS SDK. The server mints Access Tokens (JWTs) for rooms. Audio must be handled manually — Twilio Video has no built-in STT, so you pipe audio to Deepgram or similar.
 
-**Key files changed:** `bot.py` (WebSocket handler, STT integration), `static/index.html` (audio streaming)
+**Stack:** Twilio Video JS SDK (browser) + Twilio Video REST API (room/token) + Deepgram (STT) + ElevenLabs/Google TTS
 
-**Outcome:** You can speak into the browser and see your words transcribed in real time in the server logs. No Claude yet — just end-to-end speech-to-text. This is the hardest stage; once it works the rest is straightforward.
+**Pros:**
+- Stays within the existing Twilio relationship (one vendor)
+- Well-documented
 
----
-
-### Stage 3: Transcript → Claude → TTS Playback
-
-**What you build:**
-- Wire the completed transcript (from Stage 2) into Claude (via the Claude API with streaming, replacing the CLI)
-- Feed Claude's text response into a TTS service (ElevenLabs or Google TTS) and stream the audio back to the browser
-- The browser plays the audio through a standard `<audio>` element or Web Audio API
-
-**Key files changed:** `bot.py` (Claude API call, TTS integration), `static/index.html` (audio playback)
-
-**Outcome:** A fully working voice conversation through the browser — you speak, Claude responds in a synthesized voice. Functionally equivalent to the current phone bot, but browser-based with higher quality STT/TTS. This is a shippable v1 of the video bot (audio-only mode).
+**Cons:**
+- No server-side bot participant SDK — the bot can't join a room as a first-class participant; audio must be routed through the browser
+- More frontend work than Daily.co
+- No prebuilt UI
 
 ---
 
-### Stage 4: Video Frame Capture → Claude Vision
+### Approach 2: Daily.co
 
-**What you build:**
-- In the browser: periodically capture a frame from the local video track (e.g. every 3 seconds or on speech end) using a canvas, encode as JPEG, and send to the server alongside the audio/transcript
-- On the server: attach the frame to the Claude API call as an image input
+Use Daily.co as the WebRTC infrastructure. Daily has a `daily-python` SDK that lets a server process join a room as a full participant — it receives raw PCM audio from other participants and can push audio back. No virtual devices, no UI automation.
 
-**Key files changed:** `bot.py` (image handling in Claude request), `static/index.html` (frame capture + upload)
+**Stack:** Daily.co room (browser) + `daily-python` (server bot participant) + Deepgram (STT) + ElevenLabs/Google TTS
 
-**Outcome:** Claude can now see you. If you hold up an object or share your screen, Claude will reference it in its response. The conversation becomes genuinely multimodal — speech + vision, not just speech.
+**Pros:**
+- Server-side bot SDK — cleanest integration, bot joins the call like a real participant
+- Prebuilt browser UI available (embed with one line of JS)
+- Raw audio access on the server makes STT straightforward
+- Generous free tier
 
----
-
-### Stage 5: Talking Avatar (Optional)
-
-**What you build:**
-- Integrate a talking avatar API (HeyGen, D-ID, or Tavus) that takes Claude's TTS audio and generates a lip-synced video of a face
-- Stream or display the avatar video in the browser alongside (or instead of) the user's camera feed
-
-**Key files changed:** `bot.py` (avatar API integration), `static/index.html` (video element for avatar)
-
-**Outcome:** Claude has a face. The experience feels like a proper video call — the user sees a speaking avatar on one side, their own camera on the other. Higher cost and latency, but significantly more immersive.
+**Cons:**
+- New vendor (not Twilio)
+- `daily-python` SDK is less mature than Twilio's tooling
 
 ---
 
-### Stage 6: Latency & Polish
+### Approach 3: Desktop App via Virtual Display (Xvfb)
 
-**What you build:**
-- Streaming Claude responses (already supported if using the API directly) so TTS starts before the full reply is ready
-- A "thinking" visual indicator in the UI while Claude is processing
-- Graceful handling of interruptions (user speaks while Claude is responding)
-- Session cleanup, error handling, reconnection logic
+Run an existing video call app (Zoom, Telegram, etc.) on the server using a virtual display (`Xvfb`), virtual camera (`v4l2loopback`), and virtual audio (PulseAudio). Automate the UI with `xdotool`/`pyautogui` to join calls and route audio through the STT/TTS pipeline.
 
-**Outcome:** The experience feels fluid rather than turn-based. Conversations feel natural rather than like a call-and-response system with awkward pauses.
+**Stack:** Xvfb + v4l2loopback + PulseAudio + Zoom or Telegram desktop app + UI automation
+
+**Pros:**
+- Works with any existing video platform — users call you on Zoom/Telegram like a normal person
+- No custom frontend to build
+
+**Cons:**
+- UI automation is fragile — app updates break it
+- Against ToS for most platforms (bot impersonating a human participant)
+- Significant system-level setup (virtual display, camera, audio devices)
+- High operational complexity
 
 ---
 
-## Effort Summary
+## Comparison
 
-| Component | Effort | Notes |
-|---|---|---|
-| Web frontend (WebRTC) | ~1–2 days | Twilio Video JS SDK helps a lot |
-| Twilio Video Room + token endpoint | ~0.5 days | Well-documented API |
-| STT pipeline (real-time) | ~1–2 days | Deepgram has good streaming support |
-| VAD | ~0.5–1 day | Libraries exist (e.g. `webrtcvad`) |
-| Video frame capture → Claude | ~0.5–1 day | Straightforward once audio works |
-| TTS playback (audio only) | ~0.5 days | Simple if skipping avatar |
-| Talking avatar | ~2–3 days | New third-party integration |
-| Latency tuning | ~1–2 days | Iterative |
+| | Twilio Video | Daily.co | Xvfb + Desktop App |
+|---|---|---|---|
+| Server-side bot SDK | No | Yes (`daily-python`) | N/A (UI automation) |
+| Prebuilt browser UI | No | Yes | N/A |
+| Works with existing apps (Zoom etc.) | No | No | Yes |
+| Custom frontend required | Yes | Minimal | No |
+| Virtual devices needed | No | No | Yes |
+| ToS risk | Low | Low | High |
+| Operational complexity | Medium | Low | High |
+| Recommended | — | Yes | No |
 
-**Total realistic estimate without avatar: ~4–6 days of focused work**
-**With talking avatar: ~7–10 days**
-
-The hardest single piece is the real-time audio pipeline (STT + VAD) — that's where the current architecture's simplicity completely breaks down.
+**Daily.co is the recommended path** — it has the cleanest server-side integration, the least frontend work, and avoids the fragility of the Xvfb approach.
