@@ -142,3 +142,210 @@ Run an existing video call app (Zoom, Telegram, etc.) on the server using a virt
 | Recommended | — | Yes | No |
 
 **Daily.co is the recommended path** — it has the cleanest server-side integration, the least frontend work, and avoids the fragility of the Xvfb approach.
+
+---
+
+## Implementation Plan: Daily.co
+
+### Step 1: Account & Room Setup
+
+1. Create a Daily.co account at daily.co
+2. In the dashboard, create a new app and note your **API key**
+3. Add `DAILY_API_KEY` to your `.env` file
+4. Install dependencies:
+   ```bash
+   pip install daily-python deepgram-sdk anthropic elevenlabs python-dotenv
+   ```
+
+**Outcome:** You have a Daily API key and the required packages installed.
+
+---
+
+### Step 2: Room Creation Endpoint
+
+Add a `/room` endpoint to `bot.py` that creates a Daily room on demand and returns the room URL to the browser.
+
+```python
+import requests
+
+@app.route("/room", methods=["POST"])
+def create_room():
+    resp = requests.post(
+        "https://api.daily.co/v1/rooms",
+        headers={"Authorization": f"Bearer {os.getenv('DAILY_API_KEY')}"},
+        json={"properties": {"enable_chat": False, "max_participants": 2}}
+    )
+    room = resp.json()
+    return jsonify({"url": room["url"], "name": room["name"]})
+```
+
+**Outcome:** Calling `POST /room` creates a fresh Daily room and returns its URL.
+
+---
+
+### Step 3: Browser Frontend
+
+Add a minimal `static/index.html` that embeds the Daily Prebuilt UI — no custom WebRTC code needed.
+
+```html
+<!DOCTYPE html>
+<html>
+<body>
+  <button id="start">Call Claude</button>
+  <div id="call" style="display:none; width:100%; height:600px;"></div>
+  <script src="https://unpkg.com/@daily-co/daily-js"></script>
+  <script>
+    document.getElementById("start").onclick = async () => {
+      const { url } = await fetch("/room", { method: "POST" }).then(r => r.json());
+      document.getElementById("start").style.display = "none";
+      document.getElementById("call").style.display = "block";
+      const call = window.DailyIframe.createFrame(document.getElementById("call"));
+      await call.join({ url });
+    };
+  </script>
+</body>
+</html>
+```
+
+Serve it from Flask:
+```python
+from flask import send_from_directory
+
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+```
+
+**Outcome:** Opening the page in a browser shows a "Call Claude" button. Clicking it opens a Daily video room with your camera and mic. Claude isn't there yet, but the room works.
+
+---
+
+### Step 4: Bot Joins the Room (daily-python)
+
+When a room is created, the server also joins it as a bot participant using `daily-python`. The bot receives the user's raw audio frames.
+
+```python
+from daily import Daily, CallClient
+
+def start_bot(room_url):
+    Daily.init()
+    client = CallClient()
+    client.join(room_url, client_settings={
+        "inputs": {
+            "camera": False,       # bot has no camera (yet)
+            "microphone": False    # bot will push audio manually
+        }
+    })
+    client.set_audio_renderer(my_audio_callback, audio_source="remote")
+```
+
+The `my_audio_callback` function receives raw PCM audio frames from the user.
+
+**Outcome:** When a room is created, the bot silently joins it server-side and starts receiving audio. The user sees a second (bot) participant in the room.
+
+---
+
+### Step 5: STT with Deepgram
+
+Pipe the raw PCM frames from the bot's audio callback into Deepgram's streaming STT. Use Deepgram's built-in endpointing (VAD) so you get a final transcript when the user finishes speaking — no separate VAD library needed.
+
+```python
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+
+dg = DeepgramClient(os.getenv("DEEPGRAM_API_KEY"))
+dg_connection = dg.listen.live.v("1")
+dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
+dg_connection.start(LiveOptions(model="nova-2", endpointing=500))
+
+def my_audio_callback(audio_frames, *args):
+    dg_connection.send(audio_frames)
+
+def on_transcript(self, result, **kwargs):
+    transcript = result.channel.alternatives[0].transcript
+    if result.is_final and transcript:
+        handle_turn(transcript)
+```
+
+**Outcome:** When the user speaks, `handle_turn` is called with the transcribed text. End-to-end voice → text is working.
+
+---
+
+### Step 6: Claude API
+
+Replace the Claude CLI with the Anthropic Python SDK for streaming responses. Maintain a conversation history list to preserve context across turns.
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+history = []
+
+def handle_turn(transcript):
+    history.append({"role": "user", "content": transcript})
+    response_text = ""
+    with client.messages.stream(
+        model="claude-opus-4-6",
+        max_tokens=1024,
+        messages=history
+    ) as stream:
+        for text in stream.text_stream:
+            response_text += text
+            # optionally: pipe each chunk to TTS as it arrives
+    history.append({"role": "assistant", "content": response_text})
+    speak(response_text)
+```
+
+**Outcome:** Claude responds to the user's speech. Responses are contextual across the conversation.
+
+---
+
+### Step 7: TTS → Bot Speaks
+
+Convert Claude's text response to audio and push it back into the Daily room through the bot participant so the user hears it.
+
+```python
+import elevenlabs
+
+def speak(text):
+    audio = elevenlabs.generate(text=text, voice="Rachel", model="eleven_monolingual_v1")
+    # Push PCM audio back into the Daily room via the bot client
+    # daily-python accepts raw PCM via client.send_audio()
+    client.send_audio(audio)
+```
+
+**Outcome:** The full loop works — user speaks, Claude listens (via Deepgram), thinks, and responds in a synthesized voice through the call. This is a fully functional voice-over-video bot.
+
+---
+
+### Step 8: Video Frame Capture → Claude Vision (Optional)
+
+Extend `handle_turn` to also accept a video frame captured by the browser at the moment the user finishes speaking. Send the frame to Claude as an image alongside the transcript.
+
+In the browser, capture a frame when Deepgram fires its endpointing event (proxied via WebSocket):
+```js
+const canvas = document.createElement("canvas");
+canvas.drawImage(videoElement, 0, 0);
+const frame = canvas.toDataURL("image/jpeg", 0.7);
+// send frame to server alongside transcript
+```
+
+On the server, include the image in the Claude API call:
+```python
+history.append({"role": "user", "content": [
+    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}},
+    {"type": "text", "text": transcript}
+]})
+```
+
+**Outcome:** Claude can see the user. It will reference visible objects, expressions, or anything shown on camera in its responses.
+
+---
+
+### Step 9: Polish
+
+- Add a "thinking" indicator in the browser while Claude processes (show/hide a spinner via WebSocket message from the server)
+- Stream TTS as Claude responds chunk-by-chunk to reduce latency (ElevenLabs supports streaming)
+- Clean up the Daily room when the user leaves (`client.leave()` on the `participant-left` event)
+- Add `DEEPGRAM_API_KEY` and `ELEVENLABS_API_KEY` to `.env` and `setup.sh`
+
+**Outcome:** A polished, low-latency video call experience with Claude.
