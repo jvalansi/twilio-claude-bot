@@ -74,10 +74,11 @@ twilio-claude-bot/
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Create conda environment
 
 ```bash
-pip install -r requirements.txt
+conda create -n twilio-claude-bot python=3.11 -y
+/home/ubuntu/miniconda3/envs/twilio-claude-bot/bin/pip install -r requirements.txt
 ```
 
 ### 2. Configure environment
@@ -94,23 +95,37 @@ Required env vars:
 | `TWILIO_ACCOUNT_SID` | From Twilio console |
 | `TWILIO_AUTH_TOKEN` | From Twilio console |
 
-### 3. Run locally
+### 3. Set up ngrok
+
+Install ngrok and add your auth token (get it from [dashboard.ngrok.com](https://dashboard.ngrok.com/get-started/your-authtoken)):
+
+```bash
+# Install
+curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+sudo apt-get update && sudo apt-get install -y ngrok
+
+# Authenticate
+ngrok config add-authtoken <your-auth-token>
+```
+
+### 4. Run locally
 
 ```bash
 # Start the Flask server
-python bot.py
+/home/ubuntu/miniconda3/envs/twilio-claude-bot/bin/python bot.py
 
 # In another terminal, expose it via ngrok
 ngrok http 5000
 ```
 
-### 4. Configure Twilio webhook
+### 5. Configure Twilio webhook
 
 In the [Twilio console](https://console.twilio.com), go to your phone number settings and set:
 
 - **Voice webhook (HTTP POST):** `https://<your-ngrok-url>/voice`
 
-### 5. Call your number
+### 6. Call your number
 
 Dial your Twilio number and start talking to Claude.
 
