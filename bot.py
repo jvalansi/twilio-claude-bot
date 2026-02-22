@@ -2,18 +2,26 @@
 import os
 import asyncio
 import json
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client
 from dotenv import load_dotenv
 
 load_dotenv()
 
 CLAUDE_PATH = "/home/ubuntu/.local/bin/claude"
 
+account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+client = Client(account_sid, auth_token)
+
 app = Flask(__name__)
 
 # Store Claude session ID per call for conversation continuity
 call_sessions = {}
+
+# Store call context (purpose/instructions) for outbound calls
+call_contexts = {}
 
 
 async def ask_claude(message: str, session_id: str = None) -> tuple[str, str]:
@@ -54,10 +62,65 @@ def twiml_listen(say_text: str = None) -> str:
     return str(response)
 
 
+@app.route("/call", methods=["POST"])
+def initiate_call():
+    """Initiate an outbound call with optional context for Claude.
+
+    JSON body:
+        to      (str, required): E.164 phone number to call, e.g. "+14086182819"
+        context (str, optional): Instructions for Claude — what to say/do on the call.
+    """
+    data = request.get_json() or {}
+    to = data.get("to")
+    context = data.get("context", "")
+
+    if not to:
+        return jsonify({"error": "Missing 'to' phone number"}), 400
+
+    from_number = os.environ.get("TWILIO_PHONE_NUMBER")
+    if not from_number:
+        return jsonify({"error": "TWILIO_PHONE_NUMBER not configured"}), 500
+
+    base_url = os.environ.get("BASE_URL", request.host_url.rstrip("/"))
+
+    call = client.calls.create(
+        to=to,
+        from_=from_number,
+        url=f"{base_url}/voice",
+        status_callback=f"{base_url}/status",
+        status_callback_method="POST",
+    )
+
+    if context:
+        call_contexts[call.sid] = context
+
+    app.logger.info(f"[{call.sid}] Outbound call initiated to {to}")
+    return jsonify({"call_sid": call.sid, "status": call.status})
+
+
 @app.route("/voice", methods=["POST"])
 def voice():
-    """Entry point when someone calls the Twilio number."""
+    """Entry point when a call connects (inbound or outbound)."""
     call_sid = request.form.get("CallSid")
+    context = call_contexts.get(call_sid)
+
+    if context:
+        # Outbound call: prime Claude with context and get opening line
+        app.logger.info(f"[{call_sid}] Outbound call connected, context: {context[:80]}")
+        prompt = (
+            f"You are making a phone call on behalf of the user. Your goal: {context}. "
+            "Introduce yourself briefly and state your purpose in one or two sentences. "
+            "Be polite and concise — you are speaking aloud on a phone call."
+        )
+        try:
+            reply, session_id = asyncio.run(ask_claude(prompt))
+            call_sessions[call_sid] = session_id
+        except Exception as e:
+            app.logger.error(f"[{call_sid}] Claude error: {e}")
+            reply = "Hello, I'm calling to make a request. Could I speak with someone who can help me?"
+        return twiml_listen(reply)
+
+    # Inbound call: default greeting
     app.logger.info(f"[{call_sid}] Incoming call")
     return twiml_listen("Hello! I'm Claude. How can I help you?")
 
@@ -97,6 +160,7 @@ def status():
     call_status = request.form.get("CallStatus")
     if call_status in ("completed", "failed", "busy", "no-answer"):
         call_sessions.pop(call_sid, None)
+        call_contexts.pop(call_sid, None)
         app.logger.info(f"[{call_sid}] Call ended ({call_status}), session cleared")
     return "", 204
 
