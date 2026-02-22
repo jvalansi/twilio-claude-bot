@@ -69,6 +69,87 @@ The current bot has inherent latency (one full round-trip per turn) but it's acc
 
 ---
 
+## Implementation Stages
+
+Each stage builds on the previous and is independently testable.
+
+---
+
+### Stage 1: Web Frontend + Twilio Video Room
+
+**What you build:**
+- A minimal HTML/JS page that opens the user's camera and mic via the Twilio Video JS SDK and joins a Video Room
+- A `/token` endpoint in `bot.py` that mints a Twilio Access Token (JWT) scoped to a room
+- A `/room` endpoint (or static page) that serves the frontend
+
+**Key files changed:** `bot.py` (new endpoints), `static/index.html` (new)
+
+**Outcome:** You can open a browser, click "Start", and see your own camera feed in a Twilio Video Room. No Claude yet — just a working WebRTC session. Proves the plumbing works before any AI integration.
+
+---
+
+### Stage 2: Real-time Audio → STT
+
+**What you build:**
+- In the browser: capture the local audio track and stream it to the server (via WebSocket or Twilio Media Streams)
+- On the server: pipe the audio to a streaming STT service (Deepgram recommended — clean Python SDK, low latency)
+- VAD: use `webrtcvad` (Python) or Deepgram's built-in endpointing to detect end-of-utterance and emit a complete transcript
+
+**Key files changed:** `bot.py` (WebSocket handler, STT integration), `static/index.html` (audio streaming)
+
+**Outcome:** You can speak into the browser and see your words transcribed in real time in the server logs. No Claude yet — just end-to-end speech-to-text. This is the hardest stage; once it works the rest is straightforward.
+
+---
+
+### Stage 3: Transcript → Claude → TTS Playback
+
+**What you build:**
+- Wire the completed transcript (from Stage 2) into Claude (via the Claude API with streaming, replacing the CLI)
+- Feed Claude's text response into a TTS service (ElevenLabs or Google TTS) and stream the audio back to the browser
+- The browser plays the audio through a standard `<audio>` element or Web Audio API
+
+**Key files changed:** `bot.py` (Claude API call, TTS integration), `static/index.html` (audio playback)
+
+**Outcome:** A fully working voice conversation through the browser — you speak, Claude responds in a synthesized voice. Functionally equivalent to the current phone bot, but browser-based with higher quality STT/TTS. This is a shippable v1 of the video bot (audio-only mode).
+
+---
+
+### Stage 4: Video Frame Capture → Claude Vision
+
+**What you build:**
+- In the browser: periodically capture a frame from the local video track (e.g. every 3 seconds or on speech end) using a canvas, encode as JPEG, and send to the server alongside the audio/transcript
+- On the server: attach the frame to the Claude API call as an image input
+
+**Key files changed:** `bot.py` (image handling in Claude request), `static/index.html` (frame capture + upload)
+
+**Outcome:** Claude can now see you. If you hold up an object or share your screen, Claude will reference it in its response. The conversation becomes genuinely multimodal — speech + vision, not just speech.
+
+---
+
+### Stage 5: Talking Avatar (Optional)
+
+**What you build:**
+- Integrate a talking avatar API (HeyGen, D-ID, or Tavus) that takes Claude's TTS audio and generates a lip-synced video of a face
+- Stream or display the avatar video in the browser alongside (or instead of) the user's camera feed
+
+**Key files changed:** `bot.py` (avatar API integration), `static/index.html` (video element for avatar)
+
+**Outcome:** Claude has a face. The experience feels like a proper video call — the user sees a speaking avatar on one side, their own camera on the other. Higher cost and latency, but significantly more immersive.
+
+---
+
+### Stage 6: Latency & Polish
+
+**What you build:**
+- Streaming Claude responses (already supported if using the API directly) so TTS starts before the full reply is ready
+- A "thinking" visual indicator in the UI while Claude is processing
+- Graceful handling of interruptions (user speaks while Claude is responding)
+- Session cleanup, error handling, reconnection logic
+
+**Outcome:** The experience feels fluid rather than turn-based. Conversations feel natural rather than like a call-and-response system with awkward pauses.
+
+---
+
 ## Effort Summary
 
 | Component | Effort | Notes |
