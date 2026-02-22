@@ -161,3 +161,4 @@ python-dotenv
 - **STT accuracy**: Twilio's speech recognition is decent but not state-of-the-art. Upgrading to Whisper would improve accuracy
 - **Outbound calls**: Currently inbound only. Twilio supports outbound calls if you want Claude to initiate
 - **Session persistence**: Sessions are in-memory only — a server restart clears all active call sessions (acceptable since calls are short-lived)
+- **Video calls**: See [VIDEO_PLAN.md](VIDEO_PLAN.md) for a detailed plan on evolving this into a full video call experience with real-time audio, video frame capture, and an optional talking avatar
