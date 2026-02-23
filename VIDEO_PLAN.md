@@ -60,6 +60,26 @@ Claude's response is text. To play it back as video you have two options:
 | **Audio only** | TTS (e.g. ElevenLabs, Google TTS) played in the browser; Claude has no video presence | Easy |
 | **Talking avatar** | Services like HeyGen, D-ID, or Tavus generate a lip-synced video of a face speaking the TTS | Hard + costly |
 
+#### Avatar Service Comparison
+
+These services render a talking avatar from text/audio — they are not video call platforms themselves. You still need Daily.co (or similar) to deliver the avatar video stream to the user. All three support custom avatars.
+
+| | HeyGen | D-ID | Tavus |
+|---|---|---|---|
+| Real-time streaming | Yes | Yes | Yes |
+| Latency | ~1–2s | ~2–3s | ~2s |
+| Avatar quality | Excellent | Good | Excellent |
+| Custom avatar: photo | No | Yes | No |
+| Custom avatar: video | Yes (Instant/Studio) | Yes | Yes (Replica) |
+| Voice cloning | Yes | Yes | Yes (auto from video) |
+| Bring your own LLM | Yes | Yes | Limited |
+| Full conversation loop managed | No | No (yes w/ Agents add-on) | Yes |
+| Flexibility | High | High | Low |
+| Cost | Mid | Mid | High |
+| Recommended | Yes | — | — |
+
+**HeyGen is the recommended avatar service** — best quality, lowest latency, real-time streaming API, flexible custom avatars, and lets you keep Claude as the brain. For a quick all-in-one solution with less control, Tavus CVI manages the full conversation loop internally.
+
 ### 6. Latency Management (New — ongoing tuning)
 
 The current bot has inherent latency (one full round-trip per turn) but it's acceptable for phone calls. Video calls feel more synchronous. You'd need:
