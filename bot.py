@@ -4,6 +4,7 @@ import asyncio
 import json
 from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from dotenv import load_dotenv
 
@@ -19,6 +20,9 @@ app = Flask(__name__)
 
 # Store Claude session ID per call for conversation continuity
 call_sessions = {}
+
+# Store Claude session ID per SMS sender phone number
+sms_sessions = {}
 
 # Store call context (purpose/instructions) for outbound calls
 call_contexts = {}
@@ -163,6 +167,33 @@ def status():
         call_contexts.pop(call_sid, None)
         app.logger.info(f"[{call_sid}] Call ended ({call_status}), session cleared")
     return "", 204
+
+
+@app.route("/sms", methods=["POST"])
+def sms():
+    """Handle incoming SMS messages."""
+    from_number = request.form.get("From", "")
+    body = request.form.get("Body", "").strip()
+
+    app.logger.info(f"[SMS {from_number}] User: {body}")
+
+    session_id = sms_sessions.get(from_number)
+    try:
+        reply, new_session_id = asyncio.run(ask_claude(body, session_id))
+        sms_sessions[from_number] = new_session_id
+    except Exception as e:
+        app.logger.error(f"[SMS {from_number}] Claude error: {e}")
+        reply = "Sorry, something went wrong. Please try again."
+
+    app.logger.info(f"[SMS {from_number}] Claude: {reply[:80]}...")
+
+    # SMS has a practical limit; truncate if needed
+    if len(reply) > 1600:
+        reply = reply[:1597] + "..."
+
+    resp = MessagingResponse()
+    resp.message(reply)
+    return str(resp)
 
 
 if __name__ == "__main__":
