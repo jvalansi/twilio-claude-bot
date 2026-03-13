@@ -169,6 +169,24 @@ def status():
     return "", 204
 
 
+@app.route("/privacy")
+def privacy():
+    return """<html><body>
+<h1>Privacy Policy</h1>
+<p>This is a personal SMS chatbot. Messages you send are processed by Claude (Anthropic) to generate replies.
+No messages are stored permanently. No data is shared with third parties.</p>
+</body></html>"""
+
+
+@app.route("/terms")
+def terms():
+    return """<html><body>
+<h1>Terms of Service</h1>
+<p>This is a personal SMS chatbot for private use. By texting this number you consent to your messages
+being processed by an AI assistant. Message and data rates may apply.</p>
+</body></html>"""
+
+
 @app.route("/sms", methods=["POST"])
 def sms():
     """Handle incoming SMS messages."""
