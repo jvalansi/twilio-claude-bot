@@ -168,6 +168,8 @@ python-dotenv
 
 **Next step (Notion task):** Add per-call billing and customer onboarding flow — ROI hypothesis $50/mo from 5–10 customers at $0.10/call.
 
+**Notion project page:** [twilio-claude-bot — Strategy & Profitability](https://www.notion.so/twilio-claude-bot-Strategy-Profitability-32505a1b5e01819c8454e7a5be18b09b)
+
 ---
 
 ## Limitations & Future Improvements
