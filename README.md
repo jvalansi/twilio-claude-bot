@@ -154,6 +154,22 @@ python-dotenv
 
 ---
 
+## Roadmap to Profitability
+
+**Current state:** Personal demo — one phone number, no billing.
+
+| Milestone | Description | Expected Monthly ROI |
+|---|---|---|
+| **Stripe metered billing** | Charge per call or per minute | — |
+| **Customer onboarding** | Sign-up page, provision phone number, connect to Claude | $50–100/mo |
+| **Voice quality upgrade** | ElevenLabs TTS + Whisper STT for natural feel | higher conversion |
+| **Outbound campaigns** | Let customers trigger outbound calls from Claude | enterprise tier |
+| **White-label** | Businesses embed voice AI on their own number | $100–500/mo/client |
+
+**Next step (Notion task):** Add per-call billing and customer onboarding flow — ROI hypothesis $50/mo from 5–10 customers at $0.10/call.
+
+---
+
 ## Limitations & Future Improvements
 
 - **Latency**: 3-6s pause per turn is noticeable. Could add a filler phrase ("One moment...") while Claude thinks
