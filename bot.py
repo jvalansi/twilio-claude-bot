@@ -169,6 +169,56 @@ def status():
     return "", 204
 
 
+@app.route("/signup", methods=["POST", "OPTIONS"])
+def signup():
+    """Landing page signup handler — stores signup and posts to Slack."""
+    if request.method == "OPTIONS":
+        resp = app.make_response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp, 204
+
+    data = request.get_json(silent=True) or request.form.to_dict()
+    email   = (data.get("email") or "").strip()
+    project = (data.get("project") or "unknown").strip()
+    spend   = (data.get("spend") or "").strip()
+    role    = (data.get("role") or "").strip()
+
+    if not email:
+        resp = jsonify({"error": "email required"})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp, 400
+
+    import datetime
+    record = {
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "project": project, "email": email, "spend": spend, "role": role,
+    }
+    signups_file = "/home/ubuntu/validation-tool/signups.jsonl"
+    with open(signups_file, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+    slack_token = os.environ.get("SLACK_BOT_TOKEN")
+    if slack_token:
+        import urllib.request as _req
+        parts = [f"*New signup: {project}*", f"📧 {email}"]
+        if spend: parts.append(f"💰 {spend}")
+        if role:  parts.append(f"👤 {role}")
+        payload = json.dumps({"channel": "#proj-project-validation", "text": "\n".join(parts)}).encode()
+        r = _req.Request("https://slack.com/api/chat.postMessage", data=payload,
+                         headers={"Authorization": f"Bearer {slack_token}", "Content-Type": "application/json"})
+        try:
+            _req.urlopen(r, timeout=5)
+        except Exception as e:
+            app.logger.warning(f"Slack notify failed: {e}")
+
+    app.logger.info(f"[signup] {project} | {email}")
+    resp = jsonify({"ok": True})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp, 200
+
+
 @app.route("/privacy")
 def privacy():
     return """<html><body>
