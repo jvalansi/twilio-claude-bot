@@ -180,3 +180,24 @@ python-dotenv
 - **Outbound calls**: Currently inbound only. Twilio supports outbound calls if you want Claude to initiate
 - **Session persistence**: Sessions are in-memory only — a server restart clears all active call sessions (acceptable since calls are short-lived)
 - **Video calls**: See [VIDEO_PLAN.md](VIDEO_PLAN.md) for a detailed plan on evolving this into a full video call experience with real-time audio, video frame capture, and an optional talking avatar
+
+---
+
+## Outbound Calls
+
+Claude can place a call and conduct it on your behalf, then report back in Discord.
+
+```bash
+./call.py --to +14155551234 --goal "Book a table for 2 on Friday at 7pm under Jordan"
+./call.py --to +14155551234 --goal "..." --wait    # block and print the outcome
+```
+
+The call opens by disclosing that it is an AI assistant calling on the user's behalf.
+Every turn is recorded; when the call ends, `/status` asks Claude to summarise the
+outcome against the goal, writes `calls/<CallSid>.json`, and pushes the summary to the
+active cc-connect session via `cc-connect send`.
+
+`POST /call` (`{"to": ..., "context": ...}`) is the underlying endpoint if you want to
+trigger a call from elsewhere. Transcripts in `calls/` are gitignored.
+
+Checks: `python test_call.py`
