@@ -200,4 +200,15 @@ active cc-connect session via `cc-connect send`.
 `POST /call` (`{"to": ..., "context": ...}`) is the underlying endpoint if you want to
 trigger a call from elsewhere. Transcripts in `calls/` are gitignored.
 
+### Sinch (scripted calls only)
+
+```bash
+./call.py --provider sinch --to +14155551234 --say "Your package arrived."
+```
+
+Sinch has no equivalent of Twilio's `<Gather input="speech">` — `runMenu`'s voice input
+is numerical only, transcription is delivered after the call rather than turn by turn, and
+real-time media (`connectStream`) is closed beta. So Sinch can speak a scripted message
+but cannot hold a conversation. Set `SINCH_KEY`, `SINCH_SECRET`, `SINCH_NUMBER` in `.env`.
+
 Checks: `python test_call.py`
