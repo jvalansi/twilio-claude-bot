@@ -156,6 +156,7 @@ class Call:
         self.stream_sid = None
         self.call_sid = None
         self.goal = None
+        self.reporter = ("", "")   # (cc-connect project, session key)
         self.claude = ClaudeSession()
         self.frames = []            # PCM16 frames of the utterance in progress
         self.speech_run = 0
@@ -291,8 +292,16 @@ class Call:
         if self.goal:
             header += f"\nGoal: {self.goal}"
         body = summary or "(summary unavailable)"
+        project, session = self.reporter
+        project = project or os.environ.get("CC_DEFAULT_PROJECT", "")
+        session = session or os.environ.get("CC_DEFAULT_SESSION", "")
+        cmd = [CC_CONNECT_PATH, "send", "--stdin"]
+        if project:
+            cmd += ["-p", project]
+        if session:
+            cmd += ["-s", session]
         try:
-            subprocess.run([CC_CONNECT_PATH, "send", "--stdin"],
+            subprocess.run(cmd,
                            input=f"{header}\n\n{body}\n\nTranscript: {path}".encode(),
                            timeout=30, check=True, capture_output=True)
         except Exception as e:
@@ -357,7 +366,9 @@ async def ws_handler(request):
                 start = data["start"]
                 call.stream_sid = start["streamSid"]
                 call.call_sid = start.get("callSid")
-                call.goal = (start.get("customParameters") or {}).get("goal")
+                params = start.get("customParameters") or {}
+                call.goal = params.get("goal")
+                call.reporter = (params.get("project", ""), params.get("session", ""))
                 await call.claude.start()
                 print(f"[call] stream {call.stream_sid} started"
                       f"{' (outbound)' if call.goal else ''}", flush=True)
@@ -401,8 +412,12 @@ async def live(request):
     <Parameter>, which is how Twilio carries per-call data into the stream.
     """
     host = request.headers.get("X-Forwarded-Host") or request.host
-    goal = request.query.get("goal")
-    param = f"<Parameter name=\"goal\" value={quoteattr(goal)}/>" if goal else ""
+    params = "".join(
+        f"<Parameter name={quoteattr(k)} value={quoteattr(v)}/>"
+        for k in ("goal", "project", "session")
+        for v in [request.query.get(k, "")] if v
+    )
+    param = params
     return web.Response(
         text=f'<?xml version="1.0" encoding="UTF-8"?>'
              f'<Response><Connect><Stream url="wss://{host}/ws">{param}</Stream></Connect></Response>',

@@ -46,6 +46,9 @@ call_transcripts = {}
 # Store the number dialed per outbound call, for the completion report
 call_targets = {}
 
+# Store (project, session) of the chat that requested each call
+call_reporters = {}
+
 
 async def ask_claude(message: str, session_id: str = None) -> tuple[str, str]:
     """Send a message to the Claude CLI and return (reply, session_id)."""
@@ -85,11 +88,22 @@ def format_transcript(turns: list) -> str:
     return "\n".join(f"{labels.get(t['role'], t['role'])}: {t['text']}" for t in turns)
 
 
-def notify(message: str) -> None:
-    """Send a message to the active cc-connect session (Discord)."""
+def notify(message: str, project: str = "", session: str = "") -> None:
+    """Send a message to the cc-connect session that asked for the call.
+
+    Without -p/-s, cc-connect picks the first active session, which is rarely
+    the one that made the request.
+    """
+    cmd = [CC_CONNECT_PATH, "send", "--stdin"]
+    project = project or os.environ.get("CC_DEFAULT_PROJECT", "")
+    session = session or os.environ.get("CC_DEFAULT_SESSION", "")
+    if project:
+        cmd += ["-p", project]
+    if session:
+        cmd += ["-s", session]
     try:
         subprocess.run(
-            [CC_CONNECT_PATH, "send", "--stdin"],
+            cmd,
             input=message.encode(),
             timeout=30,
             check=True,
@@ -123,6 +137,8 @@ def initiate_call():
     to = data.get("to")
     context = data.get("context", "")
     realtime = data.get("realtime", False)
+    project = data.get("project", "")
+    session = data.get("session", "")
 
     if not to:
         return jsonify({"error": "Missing 'to' phone number"}), 400
@@ -136,7 +152,9 @@ def initiate_call():
     # The realtime loop takes the goal as a query param and reports for itself;
     # the Gather loop keeps its context in this process.
     if realtime:
-        voice_url = f"{base_url}/live?goal={urllib.parse.quote(context)}"
+        params = urllib.parse.urlencode(
+            {"goal": context, "project": project, "session": session})
+        voice_url = f"{base_url}/live?{params}"
     else:
         voice_url = f"{base_url}/voice"
 
@@ -152,6 +170,7 @@ def initiate_call():
         call_contexts[call.sid] = context
         call_transcripts[call.sid] = []
         call_targets[call.sid] = to
+        call_reporters[call.sid] = (project, session)
 
     app.logger.info(f"[{call.sid}] Outbound call initiated to {to}")
     return jsonify({"call_sid": call.sid, "status": call.status})
@@ -222,6 +241,7 @@ def report_outbound_call(call_sid: str, call_status: str) -> None:
     turns = call_transcripts.pop(call_sid, [])
     goal = call_contexts.get(call_sid, "")
     to = call_targets.pop(call_sid, "unknown")
+    project, session = call_reporters.pop(call_sid, ("", ""))
     session_id = call_sessions.get(call_sid)
 
     summary = ""
@@ -251,10 +271,10 @@ def report_outbound_call(call_sid: str, call_status: str) -> None:
 
     header = f"Call to {to} ended ({call_status})\nGoal: {goal}"
     if not turns:
-        notify(f"{header}\n\nNobody spoke — no transcript.")
+        notify(f"{header}\n\nNobody spoke — no transcript.", project, session)
         return
     body = summary or "(summary unavailable)"
-    notify(f"{header}\n\n{body}\n\nTranscript: {path}")
+    notify(f"{header}\n\n{body}\n\nTranscript: {path}", project, session)
 
 
 @app.route("/status", methods=["POST"])

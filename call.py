@@ -15,6 +15,7 @@ to Discord when the call ends. With --wait it blocks and prints the summary.
 """
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -38,7 +39,15 @@ def place_call(to: str, goal: str, realtime: bool = True) -> str:
 
     req = urllib.request.Request(
         f"{BOT_URL}/call",
-        data=json.dumps({"to": to, "context": goal, "realtime": realtime}).encode(),
+        data=json.dumps({
+            "to": to,
+            "context": goal,
+            "realtime": realtime,
+            # Report back to the chat session that asked, not whichever
+            # cc-connect session happens to be first in the list.
+            "project": os.environ.get("CC_PROJECT", ""),
+            "session": os.environ.get("CC_SESSION_KEY", ""),
+        }).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:

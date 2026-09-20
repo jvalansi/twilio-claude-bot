@@ -244,6 +244,12 @@ the older path. The goal travels as `/live?goal=...`, which becomes a Stream
 `<Parameter>` and reaches the socket in the start event. Both directions write
 `calls/<CallSid>.json` and push a summary to Discord when the call ends.
 
+The report goes back to the chat session that requested the call: `call.py` passes
+its `CC_PROJECT`/`CC_SESSION_KEY` through, and they ride along as Stream
+`<Parameter>`s. Without them `cc-connect send` targets the first active session,
+which is usually the wrong one. Inbound calls have no requester, so they fall back
+to `CC_DEFAULT_PROJECT`/`CC_DEFAULT_SESSION` in `.env`.
+
 Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
 window that ends the turn. The remainder is Whisper, Claude's first token, and TTS
 in roughly equal parts. Barge-in is implemented (speech during playback clears
