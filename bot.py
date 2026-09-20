@@ -3,6 +3,7 @@ import os
 import asyncio
 import json
 import subprocess
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from flask import Flask, request, jsonify
@@ -121,6 +122,7 @@ def initiate_call():
     data = request.get_json() or {}
     to = data.get("to")
     context = data.get("context", "")
+    realtime = data.get("realtime", False)
 
     if not to:
         return jsonify({"error": "Missing 'to' phone number"}), 400
@@ -131,15 +133,22 @@ def initiate_call():
 
     base_url = os.environ.get("BASE_URL", request.host_url.rstrip("/"))
 
+    # The realtime loop takes the goal as a query param and reports for itself;
+    # the Gather loop keeps its context in this process.
+    if realtime:
+        voice_url = f"{base_url}/live?goal={urllib.parse.quote(context)}"
+    else:
+        voice_url = f"{base_url}/voice"
+
     call = client.calls.create(
         to=to,
         from_=from_number,
-        url=f"{base_url}/voice",
+        url=voice_url,
         status_callback=f"{base_url}/status",
         status_callback_method="POST",
     )
 
-    if context:
+    if context and not realtime:
         call_contexts[call.sid] = context
         call_transcripts[call.sid] = []
         call_targets[call.sid] = to

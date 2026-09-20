@@ -237,7 +237,12 @@ compliance pages) to `bot.py` on 5002. `realtime.py` owns `/live` (TwiML) and `/
 (the media stream).
 
 Point a number's voice webhook at `/live` for the realtime loop, or `/voice` for the
-original Gather loop. Outbound calls from `call.py` still use `/voice`.
+original Gather loop.
+
+Outbound calls use the realtime loop by default; `./call.py --gather` opts back into
+the older path. The goal travels as `/live?goal=...`, which becomes a Stream
+`<Parameter>` and reaches the socket in the start event. Both directions write
+`calls/<CallSid>.json` and push a summary to Discord when the call ends.
 
 Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
 window that ends the turn. The remainder is Whisper, Claude's first token, and TTS

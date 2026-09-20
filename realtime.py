@@ -13,6 +13,10 @@ the in-flight TTS and Claude turn.
 """
 import asyncio
 import audioop
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from xml.sax.saxutils import quoteattr
 import base64
 import io
 import json
@@ -25,6 +29,8 @@ import aiohttp
 from aiohttp import web
 
 CLAUDE_PATH = "/home/ubuntu/.local/bin/claude"
+CC_CONNECT_PATH = os.environ.get("CC_CONNECT_PATH", "/usr/lib/node_modules/cc-connect/bin/cc-connect")
+CALLS_DIR = Path(__file__).parent / "calls"
 OPENAI_URL = "https://api.openai.com/v1"
 PORT = int(os.environ.get("REALTIME_PORT", 5000))
 FLASK_PORT = int(os.environ.get("FLASK_PORT", 5002))
@@ -46,6 +52,18 @@ SYSTEM_PROMPT = (
 )
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+OUTBOUND_OPENING = (
+    "You are placing this call on behalf of the user. Your goal: {goal}. "
+    "Open by saying you are an AI assistant calling on behalf of the user, then "
+    "state your purpose in one sentence. Speak only the words you want said aloud."
+)
+
+SUMMARY_PROMPT = (
+    "The call just ended. In 2-3 short lines, report the outcome to the user: was "
+    "the goal achieved, what was agreed (dates, times, names, amounts), and what "
+    "follow-up is needed. This is a written report, not speech. No preamble."
+)
 
 
 def openai_key() -> str:
@@ -136,6 +154,8 @@ class Call:
         self.ws = ws
         self.http = session
         self.stream_sid = None
+        self.call_sid = None
+        self.goal = None
         self.claude = ClaudeSession()
         self.frames = []            # PCM16 frames of the utterance in progress
         self.speech_run = 0
@@ -216,6 +236,68 @@ class Call:
             self.transcript.append({"role": "assistant", "text": reply})
             print(f"[claude] {reply}", flush=True)
 
+    async def collect(self, prompt: str) -> str:
+        """Run a turn and return its text without speaking it."""
+        out = []
+        async for delta in self.claude.ask(prompt):
+            out.append(delta)
+        return "".join(out).strip()
+
+    async def say_turn(self, prompt: str):
+        """Run a turn and speak it, recording both sides."""
+        buffer, spoken = "", []
+        async for delta in self.claude.ask(prompt):
+            if self.cancel:
+                break
+            buffer += delta
+            parts = SENTENCE_END.split(buffer)
+            while len(parts) > 1:
+                sentence, parts = parts[0], parts[1:]
+                if sentence.strip():
+                    spoken.append(sentence.strip())
+                    await self.speak(sentence.strip())
+                buffer = " ".join(parts)
+        if buffer.strip() and not self.cancel:
+            spoken.append(buffer.strip())
+            await self.speak(buffer.strip())
+        if spoken:
+            reply = " ".join(spoken)
+            self.transcript.append({"role": "assistant", "text": reply})
+            print(f"[claude] {reply}", flush=True)
+
+    async def report(self):
+        """Persist the transcript and push a summary to Discord."""
+        if not self.transcript:
+            return
+        summary = ""
+        try:
+            summary = await self.collect(SUMMARY_PROMPT)
+        except Exception as e:
+            print(f"summary failed: {e}", flush=True)
+
+        CALLS_DIR.mkdir(exist_ok=True)
+        path = CALLS_DIR / f"{self.call_sid or self.stream_sid}.json"
+        path.write_text(json.dumps({
+            "call_sid": self.call_sid,
+            "stream_sid": self.stream_sid,
+            "goal": self.goal,
+            "mode": "realtime",
+            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "turns": self.transcript,
+        }, indent=2, ensure_ascii=False))
+
+        header = f"Call ended ({'outbound' if self.goal else 'inbound'})"
+        if self.goal:
+            header += f"\nGoal: {self.goal}"
+        body = summary or "(summary unavailable)"
+        try:
+            subprocess.run([CC_CONNECT_PATH, "send", "--stdin"],
+                           input=f"{header}\n\n{body}\n\nTranscript: {path}".encode(),
+                           timeout=30, check=True, capture_output=True)
+        except Exception as e:
+            print(f"notify failed: {e}", flush=True)
+
     async def transcribe(self, pcm: bytes) -> str:
         form = aiohttp.FormData()
         form.add_field("file", pcm_to_wav(pcm), filename="audio.wav", content_type="audio/wav")
@@ -272,14 +354,22 @@ async def ws_handler(request):
             data = json.loads(msg.data)
             event = data.get("event")
             if event == "start":
-                call.stream_sid = data["start"]["streamSid"]
-                await call.claude.start()   # warm the process during the greeting
-                print(f"[call] stream {call.stream_sid} started", flush=True)
-                await call.speak("Hi, it's Claude. What's up?")
+                start = data["start"]
+                call.stream_sid = start["streamSid"]
+                call.call_sid = start.get("callSid")
+                call.goal = (start.get("customParameters") or {}).get("goal")
+                await call.claude.start()
+                print(f"[call] stream {call.stream_sid} started"
+                      f"{' (outbound)' if call.goal else ''}", flush=True)
+                if call.goal:
+                    await call.say_turn(OUTBOUND_OPENING.format(goal=call.goal))
+                else:
+                    await call.speak("Hi, it's Claude. What's up?")
             elif event == "media":
                 await call.on_media(data["media"]["payload"])
             elif event == "stop":
                 break
+        await call.report()
         await call.claude.close()
         print(f"[call] ended after {time.time() - started:.0f}s, "
               f"{len(call.transcript)} turns", flush=True)
@@ -305,11 +395,17 @@ async def proxy(request):
 
 
 async def live(request):
-    """TwiML that hands the call to the media stream."""
+    """TwiML that hands the call to the media stream.
+
+    An outbound call passes ?goal=... ; it reaches the socket as a Stream
+    <Parameter>, which is how Twilio carries per-call data into the stream.
+    """
     host = request.headers.get("X-Forwarded-Host") or request.host
+    goal = request.query.get("goal")
+    param = f"<Parameter name=\"goal\" value={quoteattr(goal)}/>" if goal else ""
     return web.Response(
         text=f'<?xml version="1.0" encoding="UTF-8"?>'
-             f'<Response><Connect><Stream url="wss://{host}/ws"/></Connect></Response>',
+             f'<Response><Connect><Stream url="wss://{host}/ws">{param}</Stream></Connect></Response>',
         content_type="text/xml",
     )
 
@@ -317,7 +413,7 @@ async def live(request):
 def main():
     app = web.Application()
     app.router.add_get("/ws", ws_handler)
-    app.router.add_post("/live", live)
+    app.router.add_route("*", "/live", live)
     app.router.add_route("*", "/{tail:.*}", proxy)
     print(f"realtime voice loop on :{PORT}", flush=True)
     web.run_app(app, host="0.0.0.0", port=PORT, print=None)

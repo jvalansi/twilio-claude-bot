@@ -29,7 +29,7 @@ CALLS_DIR = Path(__file__).parent / "calls"
 E164 = re.compile(r"^\+[1-9]\d{7,14}$")
 
 
-def place_call(to: str, goal: str) -> str:
+def place_call(to: str, goal: str, realtime: bool = True) -> str:
     """POST to the bot's /call endpoint and return the call SID."""
     if not E164.match(to):
         raise ValueError(f"'{to}' is not an E.164 number (e.g. +14155551234)")
@@ -38,7 +38,7 @@ def place_call(to: str, goal: str) -> str:
 
     req = urllib.request.Request(
         f"{BOT_URL}/call",
-        data=json.dumps({"to": to, "context": goal}).encode(),
+        data=json.dumps({"to": to, "context": goal, "realtime": realtime}).encode(),
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -63,6 +63,8 @@ def main() -> int:
                     help="twilio: two-way conversation. sinch: scripted message only")
     ap.add_argument("--goal", help="Twilio only — what Claude should accomplish on the call")
     ap.add_argument("--say", help="Sinch only — the message to speak")
+    ap.add_argument("--gather", action="store_true",
+                    help="Use the older Gather loop instead of the realtime stream")
     ap.add_argument("--wait", action="store_true", help="Block until the call ends and print the outcome")
     ap.add_argument("--timeout", type=int, default=900, help="Seconds to wait with --wait (default 900)")
     args = ap.parse_args()
@@ -86,7 +88,7 @@ def main() -> int:
         ap.error("--say is Sinch-only; use --goal with Twilio")
 
     try:
-        call_sid = place_call(args.to, args.goal)
+        call_sid = place_call(args.to, args.goal, realtime=not args.gather)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
