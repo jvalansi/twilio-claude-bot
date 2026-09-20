@@ -23,6 +23,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 import wave
 
 import aiohttp
@@ -34,6 +35,8 @@ CALLS_DIR = Path(__file__).parent / "calls"
 TWILIO_API = "https://api.twilio.com/2010-04-01/Accounts"
 RECORD_CALLS = os.environ.get("RECORD_CALLS", "1") == "1"
 OPENAI_URL = "https://api.openai.com/v1"
+DEEPGRAM_WS = "wss://api.deepgram.com/v1/listen"
+DEEPGRAM_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 PORT = int(os.environ.get("REALTIME_PORT", 5000))
 FLASK_PORT = int(os.environ.get("FLASK_PORT", 5002))
 
@@ -108,6 +111,77 @@ def pcm_to_wav(pcm: bytes, rate: int = TWILIO_RATE) -> bytes:
         w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+class Deepgram:
+    """Streaming speech-to-text over Deepgram's websocket.
+
+    Twilio's mulaw/8000 frames are forwarded byte-for-byte — no resampling, no
+    WAV batching — and Deepgram's own endpointing decides where an utterance
+    ends, which is what removes both the upload wait and our VAD's habit of
+    clipping the front of a sentence.
+    """
+
+    PARAMS = {
+        "model": "nova-3",
+        "encoding": "mulaw",
+        "sample_rate": str(TWILIO_RATE),
+        "channels": "1",
+        "interim_results": "true",   # required for utterance_end_ms
+        "smart_format": "true",
+        "punctuate": "true",
+        "endpointing": "300",
+        "utterance_end_ms": "1000",
+    }
+
+    def __init__(self, http: aiohttp.ClientSession, on_utterance):
+        self.http = http
+        self.on_utterance = on_utterance
+        self.ws = None
+        self.reader = None
+        self.parts = []
+
+    async def start(self):
+        url = f"{DEEPGRAM_WS}?{urllib.parse.urlencode(self.PARAMS)}"
+        self.ws = await self.http.ws_connect(
+            url, headers={"Authorization": f"Token {DEEPGRAM_KEY}"}, heartbeat=10)
+        self.reader = asyncio.create_task(self._read())
+
+    async def send(self, audio: bytes):
+        if self.ws and not self.ws.closed:
+            await self.ws.send_bytes(audio)
+
+    async def _read(self):
+        async for msg in self.ws:
+            if msg.type is not aiohttp.WSMsgType.TEXT:
+                continue
+            data = json.loads(msg.data)
+            kind = data.get("type")
+            if kind == "Results":
+                alt = data["channel"]["alternatives"][0]
+                text = alt.get("transcript", "").strip()
+                if text and data.get("is_final"):
+                    self.parts.append(text)
+                if data.get("speech_final"):
+                    await self._flush()
+            elif kind == "UtteranceEnd":
+                await self._flush()
+
+    async def _flush(self):
+        if not self.parts:
+            return
+        text, self.parts = " ".join(self.parts), []
+        await self.on_utterance(text)
+
+    async def close(self):
+        if self.ws and not self.ws.closed:
+            try:
+                await self.ws.send_json({"type": "CloseStream"})
+            except Exception:
+                pass
+            await self.ws.close()
+        if self.reader:
+            self.reader.cancel()
 
 
 class ClaudeSession:
@@ -195,6 +269,7 @@ class Call:
         # playing". A mark per sentence tells us when the audio really ended;
         # until then our own voice is still on the line, echoing back.
         self.pending_marks = set()
+        self.stt = None             # Deepgram stream, when a key is configured
         self.epoch = 0              # bumped per turn; stale playback aborts itself
         self.play_lock = asyncio.Lock()   # only one speaker on the socket at a time
         self.turn = None            # asyncio.Task for the active reply
@@ -209,7 +284,12 @@ class Call:
         if not BARGE_IN and (self.speaking or time.time() - self.quiet_since < ECHO_GUARD_S):
             return
 
-        pcm = audioop.ulaw2lin(base64.b64decode(payload), 2)
+        audio = base64.b64decode(payload)
+        if self.stt:
+            await self.stt.send(audio)   # Deepgram does its own endpointing
+            return
+
+        pcm = audioop.ulaw2lin(audio, 2)
         rms = audioop.rms(pcm, 2)
 
         if rms > SPEECH_RMS:
@@ -233,8 +313,7 @@ class Call:
             utterance = b"".join(self.frames)
             self.frames = []
             if len(utterance) > TWILIO_RATE:  # ignore blips under ~0.5s
-                self.epoch += 1     # stops playback; the old turn still drains
-                self.turn = asyncio.create_task(self.respond(utterance))
+                asyncio.create_task(self.respond(utterance))
 
     def on_mark(self, name: str):
         """Twilio finished playing audio we sent: only now are we really quiet."""
@@ -242,6 +321,18 @@ class Call:
         if not self.pending_marks:
             self.speaking = False
             self.quiet_since = time.time()
+
+    async def on_utterance(self, text: str):
+        """A finished utterance, from whichever STT produced it."""
+        if not text.strip():
+            return
+        if is_hallucination(text):
+            print(f"[skip] silence artifact: {text!r}", flush=True)
+            return
+        self.transcript.append({"role": "callee", "text": text})
+        print(f"[them] {text}", flush=True)
+        self.epoch += 1             # stops playback; the old turn still drains
+        self.turn = asyncio.create_task(self.say_turn(text))
 
     async def barge_in(self):
         """Caller started talking over us: stop playback and abandon the turn."""
@@ -254,15 +345,8 @@ class Call:
     # ---- the reply path ----
 
     async def respond(self, utterance: bytes):
-        text = await self.transcribe(utterance)
-        if not text.strip():
-            return
-        if is_hallucination(text):
-            print(f"[skip] whisper silence artifact: {text!r}", flush=True)
-            return
-        self.transcript.append({"role": "callee", "text": text})
-        print(f"[them] {text}", flush=True)
-        await self.say_turn(text)
+        """Whisper fallback: transcribe a VAD-segmented utterance, then hand it on."""
+        await self.on_utterance(await self.transcribe(utterance))
 
     async def collect(self, prompt: str) -> str:
         """Run a turn and return its text without speaking it."""
@@ -420,6 +504,12 @@ async def ws_handler(request):
                 params = start.get("customParameters") or {}
                 call.goal = params.get("goal")
                 call.reporter = (params.get("project", ""), params.get("session", ""))
+                if DEEPGRAM_KEY:
+                    call.stt = Deepgram(http, call.on_utterance)
+                    await call.stt.start()
+                    print("[stt] deepgram streaming", flush=True)
+                else:
+                    print("[stt] whisper fallback (no DEEPGRAM_API_KEY)", flush=True)
                 await call.claude.start()
                 print(f"[call] stream {call.stream_sid} started"
                       f"{' (outbound)' if call.goal else ''}", flush=True)
@@ -438,6 +528,8 @@ async def ws_handler(request):
             elif event == "stop":
                 break
         call.epoch += 1             # silence anything still speaking
+        if call.stt:
+            await call.stt.close()
         await call.report()
         await call.claude.close()
         print(f"[call] ended after {time.time() - started:.0f}s, "

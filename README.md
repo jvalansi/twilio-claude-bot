@@ -270,6 +270,13 @@ over only when every outstanding mark returns. A `clear` (barge-in) drops the
 pending marks, since cleared audio never produces them. Set `BARGE_IN=1` to listen
 through playback if you add echo cancellation.
 
+**Streaming STT (Deepgram).** With `DEEPGRAM_API_KEY` set, Twilio's mulaw/8000
+frames are forwarded byte-for-byte to `wss://api.deepgram.com/v1/listen` and
+Deepgram's endpointing decides where an utterance ends. That removes the batch
+upload wait and the local VAD, which used to clip the front of a sentence whenever
+you started talking before Claude finished. Without the key the loop falls back to
+local VAD + Whisper, unchanged.
+
 **Whisper silence artifacts.** Whisper emits "Thank you.", "you", "Bye-bye." and
 similar on silence or line noise. `is_hallucination()` drops them before they can
 supersede a turn.
