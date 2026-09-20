@@ -24,7 +24,7 @@ from pathlib import Path
 
 import sinch
 
-BOT_URL = "http://127.0.0.1:5000"
+BOT_URL = "http://127.0.0.1:5002"
 CALLS_DIR = Path(__file__).parent / "calls"
 E164 = re.compile(r"^\+[1-9]\d{7,14}$")
 

@@ -19,7 +19,14 @@ CALLS_DIR = Path(__file__).parent / "calls"
 
 account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
 auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-client = Client(account_sid, auth_token)
+api_key = os.environ.get("TWILIO_API_KEY")
+api_secret = os.environ.get("TWILIO_API_SECRET")
+
+# API keys are revocable per-integration, so prefer them over the account auth token
+if api_key and api_secret:
+    client = Client(api_key, api_secret, account_sid)
+else:
+    client = Client(account_sid, auth_token)
 
 app = Flask(__name__)
 

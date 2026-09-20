@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Low-latency voice loop: Twilio Media Streams <-> Whisper <-> Claude CLI <-> OpenAI TTS.
+
+Replaces bot.py's <Gather> turn-taking (3-6s per turn, no interruption) with a
+bidirectional audio stream. Claude runs as one long-lived CLI process per call,
+so it stays on the subscription instead of the metered API.
+
+    Twilio  --8kHz u-law-->  VAD  -->  Whisper  -->  Claude (stream-json)
+            <--8kHz u-law--  u-law <-- resample <--  OpenAI TTS (24kHz pcm)
+
+Barge-in: speech detected during playback clears Twilio's buffer and cancels
+the in-flight TTS and Claude turn.
+"""
+import asyncio
+import audioop
+import base64
+import io
+import json
+import os
+import re
+import time
+import wave
+
+import aiohttp
+from aiohttp import web
+
+CLAUDE_PATH = "/home/ubuntu/.local/bin/claude"
+OPENAI_URL = "https://api.openai.com/v1"
+PORT = int(os.environ.get("REALTIME_PORT", 5000))
+FLASK_PORT = int(os.environ.get("FLASK_PORT", 5002))
+
+# Twilio streams 8kHz mono u-law in 20ms frames (160 bytes); OpenAI TTS returns 24kHz PCM16.
+TWILIO_RATE, TTS_RATE, FRAME_BYTES = 8000, 24000, 160
+
+# VAD: RMS over 20ms frames of 16-bit PCM. Tuned for phone audio, where line
+# noise sits well under 500 and speech runs 1500+.
+SPEECH_RMS = 700
+SPEECH_FRAMES = 3           # ~60ms above threshold starts an utterance
+SILENCE_FRAMES = 25         # ~500ms below threshold ends one
+MAX_UTTERANCE_FRAMES = 1500  # ~30s hard cap
+
+SYSTEM_PROMPT = (
+    "You are on a live phone call. Your replies are spoken aloud, so keep them "
+    "to one or two sentences and never use markdown, lists, or code. "
+    "Speak naturally and conversationally. If you need a moment, say so briefly."
+)
+
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def openai_key() -> str:
+    """Read the OpenAI key from the cc-connect config (already configured for speech)."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    with open("/home/ubuntu/.cc-connect/config.toml") as f:
+        for line in f:
+            if line.strip().startswith("api_key"):
+                return line.split("=", 1)[1].strip().strip('"')
+    raise RuntimeError("no OpenAI API key found")
+
+
+OPENAI_KEY = openai_key()
+
+
+def pcm_to_wav(pcm: bytes, rate: int = TWILIO_RATE) -> bytes:
+    """Wrap raw PCM16 mono in a WAV container for the transcription endpoint."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+class ClaudeSession:
+    """One long-lived `claude -p` process per call, fed via stream-json."""
+
+    def __init__(self):
+        self.proc = None
+
+    async def start(self):
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        self.proc = await asyncio.create_subprocess_exec(
+            CLAUDE_PATH, "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--include-partial-messages", "--verbose",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt", SYSTEM_PROMPT,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env,
+        )
+
+    async def ask(self, text: str):
+        """Send a turn; yield text deltas as they arrive."""
+        msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+        await self.proc.stdin.drain()
+
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                return
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "stream_event":
+                inner = ev.get("event", {})
+                if inner.get("type") == "content_block_delta":
+                    delta = inner.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        yield delta["text"]
+            elif ev.get("type") == "result":
+                return
+
+    async def close(self):
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            self.proc.terminate()
+            await self.proc.wait()
+
+
+class Call:
+    """State for one media stream."""
+
+    def __init__(self, ws, session: aiohttp.ClientSession):
+        self.ws = ws
+        self.http = session
+        self.stream_sid = None
+        self.claude = ClaudeSession()
+        self.frames = []            # PCM16 frames of the utterance in progress
+        self.speech_run = 0
+        self.silence_run = 0
+        self.in_speech = False
+        self.speaking = False       # we are playing audio back
+        self.cancel = False         # barge-in flag for the active reply
+        self.turn = None            # asyncio.Task for the active reply
+        self.transcript = []
+
+    # ---- inbound audio ----
+
+    async def on_media(self, payload: str):
+        pcm = audioop.ulaw2lin(base64.b64decode(payload), 2)
+        rms = audioop.rms(pcm, 2)
+
+        if rms > SPEECH_RMS:
+            self.speech_run += 1
+            self.silence_run = 0
+        else:
+            self.silence_run += 1
+            self.speech_run = 0
+
+        if not self.in_speech:
+            if self.speech_run >= SPEECH_FRAMES:
+                self.in_speech = True
+                self.frames = []
+                if self.speaking:
+                    await self.barge_in()
+            return
+
+        self.frames.append(pcm)
+        if self.silence_run >= SILENCE_FRAMES or len(self.frames) >= MAX_UTTERANCE_FRAMES:
+            self.in_speech = False
+            utterance = b"".join(self.frames)
+            self.frames = []
+            if len(utterance) > TWILIO_RATE:  # ignore blips under ~0.5s
+                self.turn = asyncio.create_task(self.respond(utterance))
+
+    async def barge_in(self):
+        """Caller started talking over us: stop playback and abandon the turn."""
+        self.cancel = True
+        self.speaking = False
+        await self.ws.send_json({"event": "clear", "streamSid": self.stream_sid})
+        if self.turn and not self.turn.done():
+            self.turn.cancel()
+
+    # ---- the reply path ----
+
+    async def respond(self, utterance: bytes):
+        self.cancel = False
+        text = await self.transcribe(utterance)
+        if not text.strip():
+            return
+        self.transcript.append({"role": "callee", "text": text})
+        print(f"[them] {text}", flush=True)
+
+        buffer, spoken = "", []
+        async for delta in self.claude.ask(text):
+            if self.cancel:
+                break
+            buffer += delta
+            # Speak each finished sentence so audio starts before the reply does.
+            parts = SENTENCE_END.split(buffer)
+            while len(parts) > 1:
+                sentence, parts = parts[0], parts[1:]
+                if sentence.strip():
+                    spoken.append(sentence.strip())
+                    await self.speak(sentence.strip())
+                buffer = " ".join(parts)
+                if self.cancel:
+                    break
+        if buffer.strip() and not self.cancel:
+            spoken.append(buffer.strip())
+            await self.speak(buffer.strip())
+        if spoken:
+            reply = " ".join(spoken)
+            self.transcript.append({"role": "assistant", "text": reply})
+            print(f"[claude] {reply}", flush=True)
+
+    async def transcribe(self, pcm: bytes) -> str:
+        form = aiohttp.FormData()
+        form.add_field("file", pcm_to_wav(pcm), filename="audio.wav", content_type="audio/wav")
+        form.add_field("model", "whisper-1")
+        form.add_field("language", "en")
+        async with self.http.post(
+            f"{OPENAI_URL}/audio/transcriptions",
+            data=form,
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+        ) as r:
+            if r.status != 200:
+                print(f"stt error {r.status}: {(await r.text())[:200]}", flush=True)
+                return ""
+            return (await r.json()).get("text", "")
+
+    async def speak(self, text: str):
+        """Synthesize one sentence and stream it back as u-law frames."""
+        async with self.http.post(
+            f"{OPENAI_URL}/audio/speech",
+            json={"model": "tts-1", "voice": "alloy", "input": text, "response_format": "pcm"},
+            headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+        ) as r:
+            if r.status != 200:
+                print(f"tts error {r.status}: {(await r.text())[:200]}", flush=True)
+                return
+            pcm24 = await r.read()
+
+        pcm8, _ = audioop.ratecv(pcm24, 2, 1, TTS_RATE, TWILIO_RATE, None)
+        ulaw = audioop.lin2ulaw(pcm8, 2)
+
+        self.speaking = True
+        # Pace at real time so a barge-in can cut in mid-sentence.
+        for i in range(0, len(ulaw), FRAME_BYTES):
+            if self.cancel:
+                break
+            await self.ws.send_json({
+                "event": "media",
+                "streamSid": self.stream_sid,
+                "media": {"payload": base64.b64encode(ulaw[i:i + FRAME_BYTES]).decode()},
+            })
+            await asyncio.sleep(0.02)
+        self.speaking = False
+
+
+async def ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    async with aiohttp.ClientSession() as http:
+        call = Call(ws, http)
+        started = time.time()
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            data = json.loads(msg.data)
+            event = data.get("event")
+            if event == "start":
+                call.stream_sid = data["start"]["streamSid"]
+                await call.claude.start()   # warm the process during the greeting
+                print(f"[call] stream {call.stream_sid} started", flush=True)
+                await call.speak("Hi, it's Claude. What's up?")
+            elif event == "media":
+                await call.on_media(data["media"]["payload"])
+            elif event == "stop":
+                break
+        await call.claude.close()
+        print(f"[call] ended after {time.time() - started:.0f}s, "
+              f"{len(call.transcript)} turns", flush=True)
+    return ws
+
+
+async def proxy(request):
+    """Everything this service doesn't own belongs to bot.py (outbound calls, SMS, pages).
+
+    One ngrok tunnel means one public port, so this process fronts both.
+    """
+    body = await request.read()
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in ("host", "content-length")}
+    url = f"http://127.0.0.1:{FLASK_PORT}{request.rel_url}"
+    async with aiohttp.ClientSession() as s:
+        async with s.request(request.method, url, data=body, headers=headers,
+                             allow_redirects=False) as r:
+            data = await r.read()
+            skip = ("content-length", "transfer-encoding", "content-encoding")
+            out = {k: v for k, v in r.headers.items() if k.lower() not in skip}
+            return web.Response(status=r.status, body=data, headers=out)
+
+
+async def live(request):
+    """TwiML that hands the call to the media stream."""
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    return web.Response(
+        text=f'<?xml version="1.0" encoding="UTF-8"?>'
+             f'<Response><Connect><Stream url="wss://{host}/ws"/></Connect></Response>',
+        content_type="text/xml",
+    )
+
+
+def main():
+    app = web.Application()
+    app.router.add_get("/ws", ws_handler)
+    app.router.add_post("/live", live)
+    app.router.add_route("*", "/{tail:.*}", proxy)
+    print(f"realtime voice loop on :{PORT}", flush=True)
+    web.run_app(app, host="0.0.0.0", port=PORT, print=None)
+
+
+if __name__ == "__main__":
+    main()

@@ -212,3 +212,39 @@ real-time media (`connectStream`) is closed beta. So Sinch can speak a scripted 
 but cannot hold a conversation. Set `SINCH_KEY`, `SINCH_SECRET`, `SINCH_NUMBER` in `.env`.
 
 Checks: `python test_call.py`
+
+---
+
+## Realtime Voice Loop
+
+`realtime.py` replaces the `<Gather>` turn-taking with a bidirectional audio stream,
+so calls feel like conversation instead of walkie-talkie.
+
+```
+Twilio Media Stream (8kHz u-law)
+  -> energy VAD segments the utterance
+  -> Whisper transcribes it
+  -> one long-lived `claude -p --input-format stream-json` process per call
+  -> sentences are spoken as they finish, via OpenAI TTS (24kHz pcm -> 8kHz u-law)
+```
+
+Claude runs as the CLI, not the API, so calls stay on the Claude subscription.
+Only STT/TTS and Twilio minutes are metered.
+
+**Ports.** ngrok free serves one public URL, so `realtime.py` fronts port 5000 and
+proxies everything it does not own (`/call`, `/gather`, `/status`, `/sms`, the
+compliance pages) to `bot.py` on 5002. `realtime.py` owns `/live` (TwiML) and `/ws`
+(the media stream).
+
+Point a number's voice webhook at `/live` for the realtime loop, or `/voice` for the
+original Gather loop. Outbound calls from `call.py` still use `/voice`.
+
+Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
+window that ends the turn. The remainder is Whisper, Claude's first token, and TTS
+in roughly equal parts. Barge-in is implemented (speech during playback clears
+Twilio's buffer and cancels the turn) but has only been exercised synthetically.
+
+Services: `twilio-realtime.service` (port 5000), `twilio-claude-bot.service` (5002).
+
+Checks: `python test_realtime.py` — plays synthetic speech into the socket and
+asserts audio comes back.
