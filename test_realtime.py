@@ -58,12 +58,18 @@ async def main():
                                     {"payload": base64.b64encode(f).decode()}})
                 await asyncio.sleep(0.02)
             timings["spoke_at"] = time.time()
-            for _ in range(35):             # ~900ms silence ends the utterance
-                await ws.send_json({"event": "media", "media":
-                                    {"payload": base64.b64encode(silence).decode()}})
-                await asyncio.sleep(0.02)
 
+            # A real line never stops sending: silence keeps flowing, which is
+            # what lets streaming STT detect the end of an utterance at all.
+            async def pump_silence():
+                while True:
+                    await ws.send_json({"event": "media", "media":
+                                        {"payload": base64.b64encode(silence).decode()}})
+                    await asyncio.sleep(0.02)
+
+            pump = asyncio.create_task(pump_silence())
             await asyncio.sleep(18)         # STT + Claude + TTS
+            pump.cancel()
             reply = len(received) - greeting
             await ws.send_json({"event": "stop"})
             reader.cancel()
@@ -71,7 +77,7 @@ async def main():
     latency = timings.get("first_reply", 0) - timings["spoke_at"]
     print(f"greeting frames: {greeting}  reply frames: {reply}")
     print(f"end of speech -> first audio: {latency:.2f}s "
-          f"(includes the {35 * 0.02:.2f}s silence window that ends the turn)")
+          f"(includes a {10 * 0.02:.2f}s audio tail)")
     assert reply > 0, "no reply audio — the loop did not complete"
     print(f"audio returned: {(greeting + reply) * 0.02:.1f}s total")
     print("all checks passed")

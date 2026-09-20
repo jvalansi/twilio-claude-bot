@@ -250,9 +250,9 @@ its `CC_PROJECT`/`CC_SESSION_KEY` through, and they ride along as Stream
 which is usually the wrong one. Inbound calls have no requester, so they fall back
 to `CC_DEFAULT_PROJECT`/`CC_DEFAULT_SESSION` in `.env`.
 
-Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
-window that ends the turn. The remainder is Whisper, Claude's first token, and TTS
-in roughly equal parts. **Turn discipline.** A response is always read to the end. Abandoning `ask()`
+Measured with Deepgram: ~2.8s from end of speech to first audio, split between
+Deepgram's endpointing, Claude's first token, and TTS. The Whisper fallback path
+runs ~3.5-4s, since it adds a local silence window plus a batch upload. **Turn discipline.** A response is always read to the end. Abandoning `ask()`
 mid-read leaves the rest of the response in the pipe, and the next turn reads those
 leftovers as its own answer — which shows up as replies that lag one question behind
 and start mid-sentence. A superseded turn keeps draining and simply stops producing

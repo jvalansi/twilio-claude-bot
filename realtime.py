@@ -130,8 +130,10 @@ class Deepgram:
         "interim_results": "true",   # required for utterance_end_ms
         "smart_format": "true",
         "punctuate": "true",
-        "endpointing": "300",
-        "utterance_end_ms": "1000",
+        # 300ms splits sentences at ordinary mid-thought pauses, which makes
+        # Claude answer twice; 500 tracks natural speech without adding much wait.
+        "endpointing": "500",
+        "utterance_end_ms": "1200",
     }
 
     def __init__(self, http: aiohttp.ClientSession, on_utterance):
