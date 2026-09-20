@@ -43,6 +43,10 @@ async def main():
                             if "spoke_at" in timings and "first_reply" not in timings:
                                 timings["first_reply"] = time.time()
                             received.append(base64.b64decode(d["media"]["payload"]))
+                        elif d.get("event") == "mark":
+                            # Twilio returns the mark once the audio has played;
+                            # without this the service never stops "speaking".
+                            await ws.send_json({"event": "mark", "mark": d["mark"]})
 
             reader = asyncio.create_task(collect())
             await asyncio.sleep(6)          # let the greeting play
@@ -130,6 +134,40 @@ async def check_no_overlap():
     print("playback concurrency checks passed")
 
 
+async def check_mark_gating():
+    """We must stay deaf until Twilio says our audio finished playing.
+
+    Regression for the echo bug: speaking was cleared when the last frame was
+    *sent*, but Twilio buffers playback, so our own voice came back and was
+    transcribed as the caller.
+    """
+    import realtime
+    ws = FakeWS()
+    call = realtime.Call(ws, None)
+    call.stream_sid = "MZ"
+    call.speaking = True
+    call.pending_marks = {"turn-0-0", "turn-0-1"}
+
+    loud = audioop.lin2ulaw(b"\x40\x10" * 80, 2)
+    payload = base64.b64encode(loud).decode()
+
+    await call.on_media(payload)
+    assert call.speech_run == 0, "listened while our audio was still playing"
+
+    call.on_mark("turn-0-0")
+    assert call.speaking, "went deaf-to-live too early: one mark still outstanding"
+    call.on_mark("turn-0-1")
+    assert not call.speaking, "still speaking after the last mark"
+
+    await call.on_media(payload)     # inside the echo guard
+    assert call.speech_run == 0, "listened during the echo guard window"
+
+    call.quiet_since -= realtime.ECHO_GUARD_S + 0.1   # guard expires
+    await call.on_media(payload)
+    assert call.speech_run == 1, "never resumed listening after the guard"
+    print("mark gating checks passed")
+
+
 async def check_stream_discipline():
     """Concurrent turns must not read each other's output.
 
@@ -167,5 +205,6 @@ def check_hallucination_filter():
 if __name__ == "__main__":
     check_hallucination_filter()      # offline
     asyncio.run(check_no_overlap())   # fast, offline
+    asyncio.run(check_mark_gating())  # fast, offline
     asyncio.run(check_stream_discipline())
     sys.exit(asyncio.run(main()))     # full loop, hits the live service

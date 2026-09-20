@@ -260,9 +260,15 @@ audio; playback is gated by a per-turn epoch plus a lock, so sentences never
 interleave on the socket.
 
 **Half-duplex by default.** There is no echo cancellation, so our own audio comes
-back as caller speech (over the carrier or a speakerphone) and the bot interrupts
-itself. Input is ignored while speaking and for `ECHO_GUARD_S` afterwards. Set
-`BARGE_IN=1` to re-enable interruption if you add echo cancellation.
+back as caller speech (over the carrier or a speakerphone) and the bot answers
+itself. Input is ignored while speaking and for `ECHO_GUARD_S` afterwards.
+
+"While speaking" means until Twilio says the audio finished *playing*, not until
+the last frame was sent — Twilio buffers, so a sentence is still on the line after
+the send loop ends. Each sentence is followed by a `mark`, and playback counts as
+over only when every outstanding mark returns. A `clear` (barge-in) drops the
+pending marks, since cleared audio never produces them. Set `BARGE_IN=1` to listen
+through playback if you add echo cancellation.
 
 **Whisper silence artifacts.** Whisper emits "Thank you.", "you", "Bye-bye." and
 similar on silence or line noise. `is_hallucination()` drops them before they can

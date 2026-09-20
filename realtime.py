@@ -43,7 +43,7 @@ TWILIO_RATE, TTS_RATE, FRAME_BYTES = 8000, 24000, 160
 # VAD: RMS over 20ms frames of 16-bit PCM. Tuned for phone audio, where line
 # noise sits well under 500 and speech runs 1500+.
 SPEECH_RMS = 700
-ECHO_GUARD_S = 0.4          # ignore input for this long after we stop speaking
+ECHO_GUARD_S = 0.4          # ignore input for this long after playback actually ends
 BARGE_IN = os.environ.get("BARGE_IN", "0") == "1"
 SPEECH_FRAMES = 3           # ~60ms above threshold starts an utterance
 SILENCE_FRAMES = 25         # ~500ms below threshold ends one
@@ -190,7 +190,11 @@ class Call:
         self.silence_run = 0
         self.in_speech = False
         self.speaking = False       # we are playing audio back
-        self.quiet_since = 0.0      # when playback last stopped
+        self.quiet_since = 0.0      # when playback actually finished
+        # Twilio buffers what we send, so "finished sending" is not "finished
+        # playing". A mark per sentence tells us when the audio really ended;
+        # until then our own voice is still on the line, echoing back.
+        self.pending_marks = set()
         self.epoch = 0              # bumped per turn; stale playback aborts itself
         self.play_lock = asyncio.Lock()   # only one speaker on the socket at a time
         self.turn = None            # asyncio.Task for the active reply
@@ -232,10 +236,19 @@ class Call:
                 self.epoch += 1     # stops playback; the old turn still drains
                 self.turn = asyncio.create_task(self.respond(utterance))
 
+    def on_mark(self, name: str):
+        """Twilio finished playing audio we sent: only now are we really quiet."""
+        self.pending_marks.discard(name)
+        if not self.pending_marks:
+            self.speaking = False
+            self.quiet_since = time.time()
+
     async def barge_in(self):
         """Caller started talking over us: stop playback and abandon the turn."""
         self.epoch += 1             # every in-flight speak() sees a stale epoch and stops
         self.speaking = False
+        self.quiet_since = time.time()
+        self.pending_marks.clear()  # cleared audio never produces its marks
         await self.ws.send_json({"event": "clear", "streamSid": self.stream_sid})
 
     # ---- the reply path ----
@@ -378,8 +391,15 @@ class Call:
                     "media": {"payload": base64.b64encode(ulaw[i:i + FRAME_BYTES]).decode()},
                 })
                 await asyncio.sleep(0.02)
-            self.speaking = False
-            self.quiet_since = time.time()
+
+            if epoch == self.epoch:
+                name = f"turn-{epoch}-{len(self.pending_marks)}"
+                self.pending_marks.add(name)
+                await self.ws.send_json({"event": "mark", "streamSid": self.stream_sid,
+                                         "mark": {"name": name}})
+            else:
+                self.speaking = False
+                self.quiet_since = time.time()
 
 
 async def ws_handler(request):
@@ -413,6 +433,8 @@ async def ws_handler(request):
                         call.speak("Hi, it's Claude. What's up?"))
             elif event == "media":
                 await call.on_media(data["media"]["payload"])
+            elif event == "mark":
+                call.on_mark(data["mark"]["name"])
             elif event == "stop":
                 break
         call.epoch += 1             # silence anything still speaking
