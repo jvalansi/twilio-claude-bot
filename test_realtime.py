@@ -146,8 +146,13 @@ async def check_mark_gating():
     Regression for the echo bug: speaking was cleared when the last frame was
     *sent*, but Twilio buffers playback, so our own voice came back and was
     transcribed as the caller.
+
+    This covers the BARGE_IN=0 path. With barge-in on (the default) we listen
+    through playback on purpose and suppress echo by text instead.
     """
     import realtime
+    was = realtime.BARGE_IN
+    realtime.BARGE_IN = False
     ws = FakeWS()
     call = realtime.Call(ws, None)
     call.stream_sid = "MZ"
@@ -171,6 +176,7 @@ async def check_mark_gating():
     call.quiet_since -= realtime.ECHO_GUARD_S + 0.1   # guard expires
     await call.on_media(payload)
     assert call.speech_run == 1, "never resumed listening after the guard"
+    realtime.BARGE_IN = was
     print("mark gating checks passed")
 
 
@@ -198,6 +204,31 @@ async def check_stream_discipline():
     print("stream discipline checks passed")
 
 
+def check_echo_filter():
+    """Our own sentences must be recognised coming back — and only ours."""
+    import realtime
+    call = realtime.Call(None, None)
+    call.spoken_recent.append(("Sure, stopping.", time.time()))
+    call.spoken_recent.append(
+        ("Giraffes are the tallest land animals, up to about eighteen feet.", time.time()))
+
+    for mine in ["Giraffes are the tallest land animals up to about eighteen feet",
+                 "giraffes are the tallest land animals, up to about 18 feet.",
+                 "Sure, stopping"]:
+        assert call.is_echo(mine), f"{mine!r} is our own audio"
+
+    # the caller interrupting must survive, even though we are saying "stopping"
+    for theirs in ["Stop.", "stop", "What else can you do?", "Tell me about elephants",
+                   "no"]:
+        assert not call.is_echo(theirs), f"{theirs!r} is the caller, not echo"
+
+    # memory expires
+    call.spoken_recent.clear()
+    call.spoken_recent.append(("Sure, stopping.", time.time() - realtime.ECHO_MEMORY_S - 1))
+    assert not call.is_echo("Sure, stopping"), "echo memory should have expired"
+    print("echo filter checks passed")
+
+
 def check_hallucination_filter():
     import realtime
     for junk in ["Thank you.", "you", "Bye-bye.", " So ", "Okay.", "THANKS FOR WATCHING!"]:
@@ -210,6 +241,7 @@ def check_hallucination_filter():
 
 if __name__ == "__main__":
     check_hallucination_filter()      # offline
+    check_echo_filter()               # offline
     asyncio.run(check_no_overlap())   # fast, offline
     asyncio.run(check_mark_gating())  # fast, offline
     asyncio.run(check_stream_discipline())

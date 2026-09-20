@@ -259,9 +259,14 @@ and start mid-sentence. A superseded turn keeps draining and simply stops produc
 audio; playback is gated by a per-turn epoch plus a lock, so sentences never
 interleave on the socket.
 
-**Half-duplex by default.** There is no echo cancellation, so our own audio comes
-back as caller speech (over the carrier or a speakerphone) and the bot answers
-itself. Input is ignored while speaking and for `ECHO_GUARD_S` afterwards.
+**Barge-in with text-level echo suppression.** Our own audio comes back as caller
+speech (over the carrier or a speakerphone) and there is no echo cancellation, so
+the loop keeps a short memory of what it just said and discards transcripts that
+match it. Short utterances need a near-exact match, so "stop" still interrupts while
+the bot is saying "sure, stopping". A real interruption triggers `barge_in()`.
+
+Set `BARGE_IN=0` for the older half-duplex behaviour: input ignored while speaking
+and for `ECHO_GUARD_S` after.
 
 "While speaking" means until Twilio says the audio finished *playing*, not until
 the last frame was sent — Twilio buffers, so a sentence is still on the line after

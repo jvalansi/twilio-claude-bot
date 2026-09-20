@@ -23,6 +23,8 @@ import json
 import os
 import re
 import time
+from collections import deque
+from difflib import SequenceMatcher
 import urllib.parse
 import wave
 
@@ -47,18 +49,25 @@ TWILIO_RATE, TTS_RATE, FRAME_BYTES = 8000, 24000, 160
 # noise sits well under 500 and speech runs 1500+.
 SPEECH_RMS = 700
 ECHO_GUARD_S = 0.4          # ignore input for this long after playback actually ends
-BARGE_IN = os.environ.get("BARGE_IN", "0") == "1"
+BARGE_IN = os.environ.get("BARGE_IN", "1") == "1"
+ECHO_MEMORY_S = 12          # how long our own words can still come back at us
 SPEECH_FRAMES = 3           # ~60ms above threshold starts an utterance
 SILENCE_FRAMES = 25         # ~500ms below threshold ends one
 MAX_UTTERANCE_FRAMES = 1500  # ~30s hard cap
 
 SYSTEM_PROMPT = (
-    "You are on a live phone call. Your replies are spoken aloud, so keep them "
-    "to one or two sentences and never use markdown, lists, or code. "
-    "Speak naturally and conversationally. If you need a moment, say so briefly."
+    "You are on a live phone call. Answer in ONE short sentence — around 25 words, "
+    "never more than two sentences. The caller cannot skim, so do not volunteer "
+    "background, lists, or caveats: give the direct answer and stop. If there is "
+    "more worth saying, end with a brief offer like 'want more on that?' and wait. "
+    "Never use markdown, bullet points, or code. Speak naturally, as in conversation."
 )
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+# The first chunk may break at a clause so audio starts sooner; later chunks
+# wait for sentence ends, which sound better once the caller is already hearing us.
+CLAUSE_END = re.compile(r"(?<=[,;:])\s+")
+FIRST_CHUNK_MIN = 30
 
 # Whisper emits these verbatim on silence or line noise. Treating them as speech
 # makes the bot answer things the caller never said, and supersede itself doing it.
@@ -67,6 +76,11 @@ HALLUCINATIONS = {
     "thank you for watching", "thanks for watching", "i'll be going",
     "please subscribe", "the end", "okay", "ok", "mm", "hmm", "yeah",
 }
+
+
+def normalize(text: str) -> str:
+    """Strip everything that differs between what we said and what we hear back."""
+    return " ".join(re.sub(r"[^a-z0-9' ]", " ", text.lower()).split())
 
 
 def is_hallucination(text: str) -> bool:
@@ -272,6 +286,9 @@ class Call:
         # until then our own voice is still on the line, echoing back.
         self.pending_marks = set()
         self.stt = None             # Deepgram stream, when a key is configured
+        # What we recently said, so we can recognise it coming back. Energy-based
+        # gating cannot tell our voice from the caller's; comparing text can.
+        self.spoken_recent = deque(maxlen=12)
         self.epoch = 0              # bumped per turn; stale playback aborts itself
         self.play_lock = asyncio.Lock()   # only one speaker on the socket at a time
         self.turn = None            # asyncio.Task for the active reply
@@ -324,6 +341,28 @@ class Call:
             self.speaking = False
             self.quiet_since = time.time()
 
+    def is_echo(self, text: str) -> bool:
+        """True when this transcript is our own audio coming back to us."""
+        heard = normalize(text)
+        if not heard:
+            return False
+        now = time.time()
+        short = len(heard.split()) <= 3
+        for spoken, said_at in self.spoken_recent:
+            if now - said_at > ECHO_MEMORY_S:
+                continue
+            mine = normalize(spoken)
+            if not mine:
+                continue
+            if short:
+                # "stop" must survive even while we are saying "sure, stopping",
+                # so a short utterance only counts as echo on a near-exact match.
+                if SequenceMatcher(None, heard, mine).ratio() > 0.9:
+                    return True
+            elif heard in mine or SequenceMatcher(None, heard, mine).ratio() > 0.7:
+                return True
+        return False
+
     async def on_utterance(self, text: str):
         """A finished utterance, from whichever STT produced it."""
         if not text.strip():
@@ -331,6 +370,12 @@ class Call:
         if is_hallucination(text):
             print(f"[skip] silence artifact: {text!r}", flush=True)
             return
+        if self.is_echo(text):
+            print(f"[skip] own audio: {text!r}", flush=True)
+            return
+        if self.speaking:
+            print("[barge-in]", flush=True)
+            await self.barge_in()
         self.transcript.append({"role": "callee", "text": text})
         print(f"[them] {text}", flush=True)
         self.epoch += 1             # stops playback; the old turn still drains
@@ -369,6 +414,15 @@ class Call:
             buffer += delta
             if epoch != self.epoch:
                 continue            # superseded: keep draining, stop speaking
+
+            # Cut the opening chunk early so the caller hears something sooner.
+            if not spoken and len(buffer) >= FIRST_CHUNK_MIN:
+                clause = CLAUSE_END.split(buffer, maxsplit=1)
+                if len(clause) > 1 and not SENTENCE_END.search(buffer):
+                    head, buffer = clause[0], clause[1]
+                    spoken.append(head.strip())
+                    await self.speak(head.strip(), epoch)
+
             parts = SENTENCE_END.split(buffer)
             while len(parts) > 1:
                 sentence, parts = parts[0], parts[1:]
@@ -466,6 +520,7 @@ class Call:
         async with self.play_lock:
             if epoch != self.epoch:
                 return
+            self.spoken_recent.append((text, time.time()))
             self.speaking = True
             # Pace at real time so a barge-in can cut in mid-sentence.
             for i in range(0, len(ulaw), FRAME_BYTES):
