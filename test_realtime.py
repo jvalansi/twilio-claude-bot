@@ -73,5 +73,63 @@ async def main():
     print("all checks passed")
 
 
+# (entrypoint moved to the bottom so every check runs)
+
+
+# --- playback concurrency checks (no network) ---
+
+class FakeWS:
+    """Records what would go to Twilio, and when."""
+    def __init__(self):
+        self.frames = []
+    async def send_json(self, d):
+        if d.get("event") == "media":
+            self.frames.append(d["media"]["payload"][:8])
+
+
+async def check_no_overlap():
+    """Two speakers must never interleave, and a stale epoch must stop playing."""
+    import realtime
+    ws = FakeWS()
+    call = realtime.Call(ws, None)
+    call.stream_sid = "MZ"
+
+    # Pretend TTS already happened: patch speak's synthesis with fixed audio.
+    ulaw = bytes(realtime.FRAME_BYTES * 20)
+
+    async def fake_speak(text, epoch=None):
+        if epoch is None:
+            epoch = call.epoch
+        if epoch != call.epoch:
+            return
+        async with call.play_lock:
+            if epoch != call.epoch:
+                return
+            for i in range(0, len(ulaw), realtime.FRAME_BYTES):
+                if epoch != call.epoch:
+                    break
+                await ws.send_json({"event": "media", "streamSid": "MZ",
+                                    "media": {"payload": f"{text}-{i}"}})
+                await asyncio.sleep(0.001)
+
+    # two concurrent speakers at the same epoch: lock must serialize them
+    await asyncio.gather(fake_speak("A"), fake_speak("B"))
+    tags = [f.split("-")[0] for f in ws.frames]
+    first, second = tags[0], tags[-1]
+    assert first != second, "expected both speakers to run"
+    assert tags == sorted(tags, key=lambda t: 0 if t == first else 1), \
+        f"speakers interleaved: {tags}"
+
+    # a stale epoch stops an in-flight speaker
+    ws.frames.clear()
+    task = asyncio.create_task(fake_speak("C", call.epoch))
+    await asyncio.sleep(0.004)
+    call.epoch += 1                      # barge-in
+    await task
+    assert len(ws.frames) < 20, f"stale playback kept going: {len(ws.frames)} frames"
+    print("playback concurrency checks passed")
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    asyncio.run(check_no_overlap())   # fast, offline
+    sys.exit(asyncio.run(main()))     # full loop, hits the live service

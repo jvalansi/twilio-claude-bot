@@ -163,7 +163,8 @@ class Call:
         self.silence_run = 0
         self.in_speech = False
         self.speaking = False       # we are playing audio back
-        self.cancel = False         # barge-in flag for the active reply
+        self.epoch = 0              # bumped per turn; stale playback aborts itself
+        self.play_lock = asyncio.Lock()   # only one speaker on the socket at a time
         self.turn = None            # asyncio.Task for the active reply
         self.transcript = []
 
@@ -194,11 +195,14 @@ class Call:
             utterance = b"".join(self.frames)
             self.frames = []
             if len(utterance) > TWILIO_RATE:  # ignore blips under ~0.5s
+                if self.turn and not self.turn.done():
+                    self.turn.cancel()
+                self.epoch += 1
                 self.turn = asyncio.create_task(self.respond(utterance))
 
     async def barge_in(self):
         """Caller started talking over us: stop playback and abandon the turn."""
-        self.cancel = True
+        self.epoch += 1             # every in-flight speak() sees a stale epoch and stops
         self.speaking = False
         await self.ws.send_json({"event": "clear", "streamSid": self.stream_sid})
         if self.turn and not self.turn.done():
@@ -207,35 +211,12 @@ class Call:
     # ---- the reply path ----
 
     async def respond(self, utterance: bytes):
-        self.cancel = False
         text = await self.transcribe(utterance)
         if not text.strip():
             return
         self.transcript.append({"role": "callee", "text": text})
         print(f"[them] {text}", flush=True)
-
-        buffer, spoken = "", []
-        async for delta in self.claude.ask(text):
-            if self.cancel:
-                break
-            buffer += delta
-            # Speak each finished sentence so audio starts before the reply does.
-            parts = SENTENCE_END.split(buffer)
-            while len(parts) > 1:
-                sentence, parts = parts[0], parts[1:]
-                if sentence.strip():
-                    spoken.append(sentence.strip())
-                    await self.speak(sentence.strip())
-                buffer = " ".join(parts)
-                if self.cancel:
-                    break
-        if buffer.strip() and not self.cancel:
-            spoken.append(buffer.strip())
-            await self.speak(buffer.strip())
-        if spoken:
-            reply = " ".join(spoken)
-            self.transcript.append({"role": "assistant", "text": reply})
-            print(f"[claude] {reply}", flush=True)
+        await self.say_turn(text)
 
     async def collect(self, prompt: str) -> str:
         """Run a turn and return its text without speaking it."""
@@ -245,22 +226,23 @@ class Call:
         return "".join(out).strip()
 
     async def say_turn(self, prompt: str):
-        """Run a turn and speak it, recording both sides."""
+        """Run a turn and speak it sentence by sentence, recording both sides."""
+        epoch = self.epoch
         buffer, spoken = "", []
         async for delta in self.claude.ask(prompt):
-            if self.cancel:
-                break
+            if epoch != self.epoch:
+                return
             buffer += delta
             parts = SENTENCE_END.split(buffer)
             while len(parts) > 1:
                 sentence, parts = parts[0], parts[1:]
                 if sentence.strip():
                     spoken.append(sentence.strip())
-                    await self.speak(sentence.strip())
+                    await self.speak(sentence.strip(), epoch)
                 buffer = " ".join(parts)
-        if buffer.strip() and not self.cancel:
+        if buffer.strip() and epoch == self.epoch:
             spoken.append(buffer.strip())
-            await self.speak(buffer.strip())
+            await self.speak(buffer.strip(), epoch)
         if spoken:
             reply = " ".join(spoken)
             self.transcript.append({"role": "assistant", "text": reply})
@@ -322,8 +304,16 @@ class Call:
                 return ""
             return (await r.json()).get("text", "")
 
-    async def speak(self, text: str):
-        """Synthesize one sentence and stream it back as u-law frames."""
+    async def speak(self, text: str, epoch: int = None):
+        """Synthesize one sentence and stream it back as u-law frames.
+
+        Aborts if the epoch moved on (barge-in or a newer turn), and holds a
+        lock so two sentences can never interleave on the socket.
+        """
+        if epoch is None:
+            epoch = self.epoch
+        if epoch != self.epoch:
+            return
         async with self.http.post(
             f"{OPENAI_URL}/audio/speech",
             json={"model": "tts-1", "voice": "alloy", "input": text, "response_format": "pcm"},
@@ -337,18 +327,21 @@ class Call:
         pcm8, _ = audioop.ratecv(pcm24, 2, 1, TTS_RATE, TWILIO_RATE, None)
         ulaw = audioop.lin2ulaw(pcm8, 2)
 
-        self.speaking = True
-        # Pace at real time so a barge-in can cut in mid-sentence.
-        for i in range(0, len(ulaw), FRAME_BYTES):
-            if self.cancel:
-                break
-            await self.ws.send_json({
-                "event": "media",
-                "streamSid": self.stream_sid,
-                "media": {"payload": base64.b64encode(ulaw[i:i + FRAME_BYTES]).decode()},
-            })
-            await asyncio.sleep(0.02)
-        self.speaking = False
+        async with self.play_lock:
+            if epoch != self.epoch:
+                return
+            self.speaking = True
+            # Pace at real time so a barge-in can cut in mid-sentence.
+            for i in range(0, len(ulaw), FRAME_BYTES):
+                if epoch != self.epoch:
+                    break
+                await self.ws.send_json({
+                    "event": "media",
+                    "streamSid": self.stream_sid,
+                    "media": {"payload": base64.b64encode(ulaw[i:i + FRAME_BYTES]).decode()},
+                })
+                await asyncio.sleep(0.02)
+            self.speaking = False
 
 
 async def ws_handler(request):
@@ -372,14 +365,20 @@ async def ws_handler(request):
                 await call.claude.start()
                 print(f"[call] stream {call.stream_sid} started"
                       f"{' (outbound)' if call.goal else ''}", flush=True)
+                # As a task, not awaited: the loop must keep reading media so
+                # VAD can interrupt the opening, and so frames don't pile up.
                 if call.goal:
-                    await call.say_turn(OUTBOUND_OPENING.format(goal=call.goal))
+                    call.turn = asyncio.create_task(
+                        call.say_turn(OUTBOUND_OPENING.format(goal=call.goal)))
                 else:
-                    await call.speak("Hi, it's Claude. What's up?")
+                    call.turn = asyncio.create_task(
+                        call.speak("Hi, it's Claude. What's up?"))
             elif event == "media":
                 await call.on_media(data["media"]["payload"])
             elif event == "stop":
                 break
+        if call.turn and not call.turn.done():
+            call.turn.cancel()
         await call.report()
         await call.claude.close()
         print(f"[call] ended after {time.time() - started:.0f}s, "

@@ -252,8 +252,9 @@ to `CC_DEFAULT_PROJECT`/`CC_DEFAULT_SESSION` in `.env`.
 
 Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
 window that ends the turn. The remainder is Whisper, Claude's first token, and TTS
-in roughly equal parts. Barge-in is implemented (speech during playback clears
-Twilio's buffer and cancels the turn) but has only been exercised synthetically.
+in roughly equal parts. Barge-in clears Twilio's buffer and supersedes the turn. Playback is guarded by a
+per-turn epoch and a lock: a sentence stops mid-stream once the epoch moves on, and
+two sentences can never interleave on the socket.
 
 Services: `twilio-realtime.service` (port 5000), `twilio-claude-bot.service` (5002).
 
