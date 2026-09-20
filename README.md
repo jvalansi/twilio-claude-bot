@@ -252,9 +252,24 @@ to `CC_DEFAULT_PROJECT`/`CC_DEFAULT_SESSION` in `.env`.
 
 Measured: ~3.5s from end of speech to first audio, of which 0.7s is the silence
 window that ends the turn. The remainder is Whisper, Claude's first token, and TTS
-in roughly equal parts. Barge-in clears Twilio's buffer and supersedes the turn. Playback is guarded by a
-per-turn epoch and a lock: a sentence stops mid-stream once the epoch moves on, and
-two sentences can never interleave on the socket.
+in roughly equal parts. **Turn discipline.** A response is always read to the end. Abandoning `ask()`
+mid-read leaves the rest of the response in the pipe, and the next turn reads those
+leftovers as its own answer — which shows up as replies that lag one question behind
+and start mid-sentence. A superseded turn keeps draining and simply stops producing
+audio; playback is gated by a per-turn epoch plus a lock, so sentences never
+interleave on the socket.
+
+**Half-duplex by default.** There is no echo cancellation, so our own audio comes
+back as caller speech (over the carrier or a speakerphone) and the bot interrupts
+itself. Input is ignored while speaking and for `ECHO_GUARD_S` afterwards. Set
+`BARGE_IN=1` to re-enable interruption if you add echo cancellation.
+
+**Whisper silence artifacts.** Whisper emits "Thank you.", "you", "Bye-bye." and
+similar on silence or line noise. `is_hallucination()` drops them before they can
+supersede a turn.
+
+**Recording.** `RECORD_CALLS=1` (default) records both directions; audio is
+retrievable from Twilio. Note that some US states require all-party consent.
 
 Services: `twilio-realtime.service` (port 5000), `twilio-claude-bot.service` (5002).
 

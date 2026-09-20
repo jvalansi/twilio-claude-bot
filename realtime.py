@@ -31,6 +31,8 @@ from aiohttp import web
 CLAUDE_PATH = "/home/ubuntu/.local/bin/claude"
 CC_CONNECT_PATH = os.environ.get("CC_CONNECT_PATH", "/usr/lib/node_modules/cc-connect/bin/cc-connect")
 CALLS_DIR = Path(__file__).parent / "calls"
+TWILIO_API = "https://api.twilio.com/2010-04-01/Accounts"
+RECORD_CALLS = os.environ.get("RECORD_CALLS", "1") == "1"
 OPENAI_URL = "https://api.openai.com/v1"
 PORT = int(os.environ.get("REALTIME_PORT", 5000))
 FLASK_PORT = int(os.environ.get("FLASK_PORT", 5002))
@@ -41,6 +43,8 @@ TWILIO_RATE, TTS_RATE, FRAME_BYTES = 8000, 24000, 160
 # VAD: RMS over 20ms frames of 16-bit PCM. Tuned for phone audio, where line
 # noise sits well under 500 and speech runs 1500+.
 SPEECH_RMS = 700
+ECHO_GUARD_S = 0.4          # ignore input for this long after we stop speaking
+BARGE_IN = os.environ.get("BARGE_IN", "0") == "1"
 SPEECH_FRAMES = 3           # ~60ms above threshold starts an utterance
 SILENCE_FRAMES = 25         # ~500ms below threshold ends one
 MAX_UTTERANCE_FRAMES = 1500  # ~30s hard cap
@@ -52,6 +56,20 @@ SYSTEM_PROMPT = (
 )
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+# Whisper emits these verbatim on silence or line noise. Treating them as speech
+# makes the bot answer things the caller never said, and supersede itself doing it.
+HALLUCINATIONS = {
+    "you", "thank you", "thanks", "bye", "bye-bye", "goodbye", "so", "uh", "um",
+    "thank you for watching", "thanks for watching", "i'll be going",
+    "please subscribe", "the end", "okay", "ok", "mm", "hmm", "yeah",
+}
+
+
+def is_hallucination(text: str) -> bool:
+    """True when the transcript is one of Whisper's stock silence outputs."""
+    cleaned = re.sub(r"[^a-z' -]", "", text.strip().lower()).strip()
+    return cleaned in HALLUCINATIONS
 
 OUTBOUND_OPENING = (
     "You are placing this call on behalf of the user. Your goal: {goal}. "
@@ -97,6 +115,9 @@ class ClaudeSession:
 
     def __init__(self):
         self.proc = None
+        # Serializes turns. Abandoning a read mid-response leaves the rest of it
+        # in the pipe, and the next turn reads those leftovers as its own answer.
+        self.lock = asyncio.Lock()
 
     async def start(self):
         env = os.environ.copy()
@@ -115,27 +136,33 @@ class ClaudeSession:
         )
 
     async def ask(self, text: str):
-        """Send a turn; yield text deltas as they arrive."""
-        msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-        await self.proc.stdin.drain()
+        """Send a turn; yield text deltas until this response is fully drained.
 
-        while True:
-            line = await self.proc.stdout.readline()
-            if not line:
-                return
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "stream_event":
-                inner = ev.get("event", {})
-                if inner.get("type") == "content_block_delta":
-                    delta = inner.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        yield delta["text"]
-            elif ev.get("type") == "result":
-                return
+        Callers must consume this to exhaustion — stopping early desynchronizes
+        every later turn.
+        """
+        async with self.lock:
+            msg = {"type": "user",
+                   "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+            await self.proc.stdin.drain()
+
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    return
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") == "stream_event":
+                    inner = ev.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield delta["text"]
+                elif ev.get("type") == "result":
+                    return
 
     async def close(self):
         if self.proc and self.proc.returncode is None:
@@ -163,6 +190,7 @@ class Call:
         self.silence_run = 0
         self.in_speech = False
         self.speaking = False       # we are playing audio back
+        self.quiet_since = 0.0      # when playback last stopped
         self.epoch = 0              # bumped per turn; stale playback aborts itself
         self.play_lock = asyncio.Lock()   # only one speaker on the socket at a time
         self.turn = None            # asyncio.Task for the active reply
@@ -171,6 +199,12 @@ class Call:
     # ---- inbound audio ----
 
     async def on_media(self, payload: str):
+        # Twilio streams our own audio back on the same leg on some carriers, and
+        # a speakerphone echoes it acoustically. With no echo cancellation, the
+        # only reliable fix is not to listen while talking.
+        if not BARGE_IN and (self.speaking or time.time() - self.quiet_since < ECHO_GUARD_S):
+            return
+
         pcm = audioop.ulaw2lin(base64.b64decode(payload), 2)
         rms = audioop.rms(pcm, 2)
 
@@ -195,9 +229,7 @@ class Call:
             utterance = b"".join(self.frames)
             self.frames = []
             if len(utterance) > TWILIO_RATE:  # ignore blips under ~0.5s
-                if self.turn and not self.turn.done():
-                    self.turn.cancel()
-                self.epoch += 1
+                self.epoch += 1     # stops playback; the old turn still drains
                 self.turn = asyncio.create_task(self.respond(utterance))
 
     async def barge_in(self):
@@ -205,14 +237,15 @@ class Call:
         self.epoch += 1             # every in-flight speak() sees a stale epoch and stops
         self.speaking = False
         await self.ws.send_json({"event": "clear", "streamSid": self.stream_sid})
-        if self.turn and not self.turn.done():
-            self.turn.cancel()
 
     # ---- the reply path ----
 
     async def respond(self, utterance: bytes):
         text = await self.transcribe(utterance)
         if not text.strip():
+            return
+        if is_hallucination(text):
+            print(f"[skip] whisper silence artifact: {text!r}", flush=True)
             return
         self.transcript.append({"role": "callee", "text": text})
         print(f"[them] {text}", flush=True)
@@ -226,13 +259,17 @@ class Call:
         return "".join(out).strip()
 
     async def say_turn(self, prompt: str):
-        """Run a turn and speak it sentence by sentence, recording both sides."""
+        """Run a turn and speak it sentence by sentence, recording both sides.
+
+        The response is always read to the end; a superseded turn simply stops
+        producing audio rather than abandoning the stream mid-response.
+        """
         epoch = self.epoch
         buffer, spoken = "", []
         async for delta in self.claude.ask(prompt):
-            if epoch != self.epoch:
-                return
             buffer += delta
+            if epoch != self.epoch:
+                continue            # superseded: keep draining, stop speaking
             parts = SENTENCE_END.split(buffer)
             while len(parts) > 1:
                 sentence, parts = parts[0], parts[1:]
@@ -342,6 +379,7 @@ class Call:
                 })
                 await asyncio.sleep(0.02)
             self.speaking = False
+            self.quiet_since = time.time()
 
 
 async def ws_handler(request):
@@ -377,8 +415,7 @@ async def ws_handler(request):
                 await call.on_media(data["media"]["payload"])
             elif event == "stop":
                 break
-        if call.turn and not call.turn.done():
-            call.turn.cancel()
+        call.epoch += 1             # silence anything still speaking
         await call.report()
         await call.claude.close()
         print(f"[call] ended after {time.time() - started:.0f}s, "
@@ -404,12 +441,32 @@ async def proxy(request):
             return web.Response(status=r.status, body=data, headers=out)
 
 
+async def start_recording(call_sid: str):
+    """Record the call so it can be listened to afterwards, not just read."""
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    user = os.environ.get("TWILIO_API_KEY") or sid
+    pw = os.environ.get("TWILIO_API_SECRET") or os.environ.get("TWILIO_AUTH_TOKEN")
+    if not (sid and user and pw and call_sid):
+        return
+    auth = aiohttp.BasicAuth(user, pw)
+    async with aiohttp.ClientSession(auth=auth) as http:
+        async with http.post(f"{TWILIO_API}/{sid}/Calls/{call_sid}/Recordings.json") as r:
+            if r.status not in (200, 201):
+                print(f"recording failed {r.status}: {(await r.text())[:150]}", flush=True)
+
+
 async def live(request):
     """TwiML that hands the call to the media stream.
 
     An outbound call passes ?goal=... ; it reaches the socket as a Stream
     <Parameter>, which is how Twilio carries per-call data into the stream.
     """
+    if RECORD_CALLS:
+        form = await request.post()
+        call_sid = form.get("CallSid")
+        if call_sid:
+            asyncio.create_task(start_recording(call_sid))
+
     host = request.headers.get("X-Forwarded-Host") or request.host
     params = "".join(
         f"<Parameter name={quoteattr(k)} value={quoteattr(v)}/>"

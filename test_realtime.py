@@ -130,6 +130,42 @@ async def check_no_overlap():
     print("playback concurrency checks passed")
 
 
+async def check_stream_discipline():
+    """Concurrent turns must not read each other's output.
+
+    Regression for the bug where abandoning a response mid-read left the rest in
+    the pipe, so every later turn answered the previous question.
+    """
+    import realtime
+    sess = realtime.ClaudeSession()
+    await sess.start()
+    try:
+        async def ask(t):
+            return "".join([d async for d in sess.ask(t)])
+
+        a, b = await asyncio.gather(
+            ask("Reply with exactly one word: ALPHA"),
+            ask("Reply with exactly one word: BRAVO"),
+        )
+        assert "ALPHA" in a and "BRAVO" not in a, f"turn 1 read the wrong response: {a!r}"
+        assert "BRAVO" in b and "ALPHA" not in b, f"turn 2 read the wrong response: {b!r}"
+    finally:
+        await sess.close()
+    print("stream discipline checks passed")
+
+
+def check_hallucination_filter():
+    import realtime
+    for junk in ["Thank you.", "you", "Bye-bye.", " So ", "Okay.", "THANKS FOR WATCHING!"]:
+        assert realtime.is_hallucination(junk), f"{junk!r} should be filtered"
+    for real in ["Can you tell me about giraffes?", "thank you for calling, I need help",
+                 "yes please", "bye for now, but first"]:
+        assert not realtime.is_hallucination(real), f"{real!r} should not be filtered"
+    print("hallucination filter checks passed")
+
+
 if __name__ == "__main__":
+    check_hallucination_filter()      # offline
     asyncio.run(check_no_overlap())   # fast, offline
+    asyncio.run(check_stream_discipline())
     sys.exit(asyncio.run(main()))     # full loop, hits the live service

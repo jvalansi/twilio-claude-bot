@@ -162,6 +162,7 @@ def initiate_call():
         to=to,
         from_=from_number,
         url=voice_url,
+        record=os.environ.get("RECORD_CALLS", "1") == "1",
         status_callback=f"{base_url}/status",
         status_callback_method="POST",
     )
